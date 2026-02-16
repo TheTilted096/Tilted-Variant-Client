@@ -4,6 +4,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
+from uci_handler import UCIHandler
 
 
 class ChessComInterface:
@@ -30,6 +31,99 @@ class ChessComInterface:
             time.sleep(0.3)
         except Exception as e:
             print(f"[ChessCom] Warning: Could not focus browser: {e}")
+
+    def detect_board_size(self):
+        """
+        Detect the board size (files x ranks) by analyzing coordinate labels.
+
+        Supports various board sizes: 4x4, 6x6, 8x8, 10x8, 14x14, etc.
+
+        Returns:
+            dict: {
+                'files': int,  # Number of files (a-h = 8, a-j = 10, etc.)
+                'ranks': int,  # Number of ranks (1-8 = 8, 1-4 = 4, etc.)
+                'method': str  # Detection method used
+            }
+        """
+        js_script = """
+        // Find the main game board
+        const board = document.querySelector('.TheBoard-squares') ||
+                     document.querySelector('[class*="Board-squares"]') ||
+                     document.querySelector('.board') ||
+                     document.querySelector('[class*="board"]');
+
+        if (!board) {
+            return { files: 8, ranks: 8, method: 'default-no-board' };
+        }
+
+        const boardRect = board.getBoundingClientRect();
+        const margin = 60; // Area around board where labels appear
+
+        // Collect all coordinate labels near the board
+        const allElements = Array.from(document.querySelectorAll('*'));
+        const fileLetters = new Set();
+        const rankNumbers = new Set();
+
+        for (let el of allElements) {
+            const text = el.textContent?.trim();
+            if (!text || text.length > 3) continue;
+
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
+
+            // Check if element is near the board
+            const nearBoard = (
+                Math.abs(rect.left - boardRect.right) < margin ||
+                Math.abs(rect.right - boardRect.left) < margin ||
+                Math.abs(rect.top - boardRect.bottom) < margin ||
+                Math.abs(rect.bottom - boardRect.top) < margin
+            );
+
+            if (!nearBoard) continue;
+
+            // Check for file letters (a-z)
+            if (/^[a-z]$/.test(text)) {
+                fileLetters.add(text);
+            }
+            // Check for rank numbers (1-14)
+            else if (/^[0-9]+$/.test(text)) {
+                const num = parseInt(text);
+                if (num >= 1 && num <= 14) {
+                    rankNumbers.add(num);
+                }
+            }
+        }
+
+        // Determine board size from labels
+        let files = 8, ranks = 8;
+        let method = 'default';
+
+        if (fileLetters.size > 0 && rankNumbers.size > 0) {
+            // Find max file letter
+            const maxFile = Array.from(fileLetters).sort().pop();
+            files = maxFile.charCodeAt(0) - 'a'.charCodeAt(0) + 1;
+
+            // Find max rank number
+            ranks = Math.max(...Array.from(rankNumbers));
+
+            method = 'coordinate-labels';
+        }
+
+        return { files, ranks, method };
+        """
+
+        try:
+            result = self.driver.execute_script(js_script)
+            files = result.get('files', 8)
+            ranks = result.get('ranks', 8)
+            method = result.get('method', 'unknown')
+
+            print(f"[Board] Size detected: {files}x{ranks} (method: {method})")
+            return result
+
+        except Exception as e:
+            print(f"[Board] Error detecting size, defaulting to 8x8: {e}")
+            return {'files': 8, 'ranks': 8, 'method': 'error'}
 
     def get_turn(self):
         """
@@ -127,57 +221,66 @@ class ChessComInterface:
             };
         }
 
-        // METHOD 2: Analyze coordinate labels
+        // METHOD 2: Analyze coordinate labels (generalized for any board size)
         const margin = 40; // Coordinate labels are right next to the board
         const allElements = Array.from(document.querySelectorAll('*'));
         const coordinates = [];
+        const allRankNumbers = new Set();
 
+        // First pass: find all rank numbers near the board
         for (let el of allElements) {
             const text = el.textContent?.trim();
 
-            if ((text === '1' || text === '8') && el.textContent.length <= 3) {
-                const rect = el.getBoundingClientRect();
+            // Check if it's a number between 1-14 (support up to 14x14 boards)
+            if (/^[0-9]+$/.test(text) && text.length <= 3) {
+                const num = parseInt(text);
+                if (num >= 1 && num <= 14) {
+                    const rect = el.getBoundingClientRect();
 
-                if (rect.width > 0 && rect.height > 0) {
-                    const className = String(el.className || '').toLowerCase();
-                    const labelInfo = {
-                        text: text,
-                        top: Math.round(rect.top),
-                        left: Math.round(rect.left),
-                        width: Math.round(rect.width),
-                        height: Math.round(rect.height),
-                        className: el.className
-                    };
-
-                    // Track ALL labels for debugging
-                    debug.allLabels.push(labelInfo);
-
-                    // FILTER 1: Exclude UI elements (notifications, icons, badges)
-                    const isUIElement = className.includes('notification') ||
-                                       className.includes('icon') ||
-                                       className.includes('badge') ||
-                                       className.includes('button') ||
-                                       className.includes('menu');
-
-                    if (isUIElement) {
-                        labelInfo.excluded = 'UI element';
-                        continue;
-                    }
-
-                    // FILTER 2: Must be near the board (within 40px)
-                    const nearBoard =
-                        Math.abs(rect.left - boardRect.left) < margin ||
-                        Math.abs(rect.right - boardRect.right) < margin ||
-                        Math.abs(rect.top - boardRect.top) < margin ||
-                        Math.abs(rect.bottom - boardRect.bottom) < margin;
-
-                    if (nearBoard) {
-                        debug.nearLabels.push(labelInfo);
-                        coordinates.push({
+                    if (rect.width > 0 && rect.height > 0) {
+                        const className = String(el.className || '').toLowerCase();
+                        const labelInfo = {
                             text: text,
-                            top: rect.top,
-                            left: rect.left
-                        });
+                            number: num,
+                            top: Math.round(rect.top),
+                            left: Math.round(rect.left),
+                            width: Math.round(rect.width),
+                            height: Math.round(rect.height),
+                            className: el.className
+                        };
+
+                        // Track ALL labels for debugging
+                        debug.allLabels.push(labelInfo);
+
+                        // FILTER 1: Exclude UI elements (notifications, icons, badges)
+                        const isUIElement = className.includes('notification') ||
+                                           className.includes('icon') ||
+                                           className.includes('badge') ||
+                                           className.includes('button') ||
+                                           className.includes('menu');
+
+                        if (isUIElement) {
+                            labelInfo.excluded = 'UI element';
+                            continue;
+                        }
+
+                        // FILTER 2: Must be near the board (within 40px)
+                        const nearBoard =
+                            Math.abs(rect.left - boardRect.left) < margin ||
+                            Math.abs(rect.right - boardRect.right) < margin ||
+                            Math.abs(rect.top - boardRect.top) < margin ||
+                            Math.abs(rect.bottom - boardRect.bottom) < margin;
+
+                        if (nearBoard) {
+                            debug.nearLabels.push(labelInfo);
+                            allRankNumbers.add(num);
+                            coordinates.push({
+                                text: text,
+                                number: num,
+                                top: rect.top,
+                                left: rect.left
+                            });
+                        }
                     }
                 }
             }
@@ -192,18 +295,22 @@ class ChessComInterface:
             debug.topmost = { text: topmost.text, top: Math.round(topmost.top) };
             debug.bottommost = { text: bottommost.text, top: Math.round(bottommost.top) };
 
-            if (topmost.text === '1') {
+            // Determine min and max ranks
+            const minRank = Math.min(...Array.from(allRankNumbers));
+            const maxRank = Math.max(...Array.from(allRankNumbers));
+
+            if (topmost.number === minRank) {
                 return {
                     is_flipped: true,
                     method: 'coordinate-labels',
-                    detail: 'rank 1 at top (black perspective)',
+                    detail: `rank ${minRank} at top (black perspective)`,
                     debug: debug
                 };
-            } else if (topmost.text === '8') {
+            } else if (topmost.number === maxRank) {
                 return {
                     is_flipped: false,
                     method: 'coordinate-labels',
-                    detail: 'rank 8 at top (white perspective)',
+                    detail: `rank ${maxRank} at top (white perspective)`,
                     debug: debug
                 };
             }
@@ -529,28 +636,37 @@ class ChessComInterface:
     # Use browser DevTools console for detailed inspection if needed
 
 
-    def get_square_coordinates(self, square, is_flipped=None):
+    def get_square_coordinates(self, square, is_flipped=None, board_size=None):
         """
         Get the pixel coordinates of a square on the chess.com board.
-        Automatically adjusts for board flip (playing as Black).
+        Automatically adjusts for board flip and board size.
 
         Args:
-            square: Square in UCI format (e.g., 'e2', 'd4')
+            square: Square in UCI format (e.g., 'e2', 'd4', 'j8')
             is_flipped: Optional pre-computed board flip state (True/False).
+                       If None, will detect automatically.
+            board_size: Optional pre-computed board size dict {'files': int, 'ranks': int}.
                        If None, will detect automatically.
 
         Returns:
             dict: {'x': x_coord, 'y': y_coord} or None if not found
         """
         file_letter = square[0]
-        rank_number = square[1]
+        rank_number = int(square[1:])  # Support multi-digit ranks (e.g., '10', '14')
 
-        # Convert file letter to number (a=1, b=2, ..., h=8)
+        # Convert file letter to number (a=1, b=2, ..., j=10, etc.)
         file_num = ord(file_letter) - ord('a') + 1
 
         # Detect board orientation (only if not provided)
         if is_flipped is None:
             is_flipped = self.is_board_flipped()
+
+        # Detect board size (only if not provided)
+        if board_size is None:
+            board_size = self.detect_board_size()
+
+        num_files = board_size.get('files', 8)
+        num_ranks = board_size.get('ranks', 8)
 
         js_script = f"""
         // Find the chess board
@@ -565,27 +681,29 @@ class ChessComInterface:
         }}
 
         const rect = board.getBoundingClientRect();
-        const squareSize = rect.width / 8;
+        const numFiles = {num_files};
+        const numRanks = {num_ranks};
+        const squareSize = rect.width / numFiles;
         const isFlipped = {str(is_flipped).lower()};
 
         let fileIndex, rankIndex;
 
         if (isFlipped) {{
             // BLACK ON BOTTOM (flipped board)
-            // Visual layout: h8 h7 h6... (bottom-left) to a8 a7 a6... (bottom-right)
-            //                h1 h2 h3... (top-left) to a1 a2 a3... (top-right)
+            // For any board size NxM:
+            // Visual: rightmost file at left, rank 1 at bottom
             // Pixel coords (0,0) at top-left
-            fileIndex = 8 - {file_num};  // h=0, g=1, f=2, ..., a=7
-            rankIndex = {rank_number} - 1;  // 1=0, 2=1, ..., 8=7
-            console.log('[Coords] FLIPPED: square={square} -> fileIndex=' + fileIndex + ', rankIndex=' + rankIndex);
+            fileIndex = numFiles - {file_num};  // rightmost=0, ..., leftmost=numFiles-1
+            rankIndex = {rank_number} - 1;      // rank 1=0, rank 2=1, ..., rank N=N-1
+            console.log('[Coords] FLIPPED ({square}): fileIndex=' + fileIndex + ', rankIndex=' + rankIndex);
         }} else {{
             // WHITE ON BOTTOM (normal board)
-            // Visual layout: a1 b1 c1... (bottom-left) to h1 (bottom-right)
-            //                a8 b8 c8... (top-left) to h8 (top-right)
+            // For any board size NxM:
+            // Visual: leftmost file at left, highest rank at top
             // Pixel coords (0,0) at top-left
-            fileIndex = {file_num} - 1;  // a=0, b=1, c=2, ..., h=7
-            rankIndex = 8 - {rank_number};  // 8=0, 7=1, ..., 1=7
-            console.log('[Coords] NORMAL: {square} -> fileIndex=' + fileIndex + ', rankIndex=' + rankIndex);
+            fileIndex = {file_num} - 1;         // a=0, b=1, c=2, ...
+            rankIndex = numRanks - {rank_number};  // highest rank=0, ..., rank 1=numRanks-1
+            console.log('[Coords] NORMAL ({square}): fileIndex=' + fileIndex + ', rankIndex=' + rankIndex);
         }}
 
         const x = rect.left + (fileIndex * squareSize) + (squareSize / 2);
@@ -596,6 +714,7 @@ class ChessComInterface:
             y: y,
             method: 'calculated',
             flipped: isFlipped,
+            boardSize: {{ files: numFiles, ranks: numRanks }},
             debug: {{
                 boardRect: {{ left: rect.left, top: rect.top, width: rect.width, height: rect.height }},
                 squareSize: squareSize,
@@ -619,15 +738,20 @@ class ChessComInterface:
         Works in background without window focus!
 
         Args:
-            uci_move: Move in UCI format (e.g., 'e2e4', 'd7d5')
+            uci_move: Move in UCI format (e.g., 'e2e4', 'd7d5', 'g14n7')
 
         Returns:
             bool: True if move was successful, False otherwise
         """
         try:
-            # Parse UCI move
-            from_square = uci_move[:2]
-            to_square = uci_move[2:4]
+            # Parse UCI move properly (handles multi-digit ranks)
+            parsed = UCIHandler.parse_uci_move(uci_move)
+            if not parsed or parsed.get('type') != 'normal':
+                print(f"[ChessCom] ✗ Invalid move format: {uci_move}")
+                return False
+
+            from_square = parsed['from']
+            to_square = parsed['to']
 
             print(f"[ChessCom] Move: {from_square} → {to_square}")
 
@@ -704,7 +828,7 @@ class ChessComInterface:
         This method does NOT require window focus and can work in the background.
 
         Args:
-            uci_move: Move in UCI format (e.g., 'e2e4', 'd7d5')
+            uci_move: Move in UCI format (e.g., 'e2e4', 'd7d5', 'g14n7')
 
         Returns:
             bool: True if move was successful, False otherwise
@@ -713,9 +837,14 @@ class ChessComInterface:
             # Check whose turn it is
             turn = self.get_turn()
 
-            # Parse UCI move
-            from_square = uci_move[:2]
-            to_square = uci_move[2:4]
+            # Parse UCI move properly (handles multi-digit ranks)
+            parsed = UCIHandler.parse_uci_move(uci_move)
+            if not parsed or parsed.get('type') != 'normal':
+                print(f"[ChessCom] ✗ Invalid move format: {uci_move}")
+                return False
+
+            from_square = parsed['from']
+            to_square = parsed['to']
 
             print(f"[ChessCom] Move: {from_square} -> {to_square}")
 
@@ -851,7 +980,8 @@ class ChessComInterface:
         Handle pawn promotion dialog after a promotion move.
 
         Args:
-            promotion_piece: UCI promotion character ('q', 'r', 'b', 'n', 'k', etc.)
+            promotion_piece: UCI promotion character ('q', 'r', 'b', 'n', 'k', 'u', 'w', 'f', 'a', 'c')
+                            UCI: a=Archbishop, c=Chancellor (chess.com: H, E)
 
         Returns:
             bool: True if promotion was handled successfully, False otherwise
@@ -864,13 +994,19 @@ class ChessComInterface:
 
             js_script = """
             // Map UCI promotion characters to piece types
+            // NOTE: UCI uses 'a'/'c' for Archbishop/Chancellor, but chess.com uses 'H'/'E'
             const promotionPiece = arguments[0].toLowerCase();
             const pieceMap = {
                 'q': 'Q',  // Queen
                 'r': 'R',  // Rook
                 'b': 'B',  // Bishop
                 'n': 'N',  // Knight
-                'k': 'K'   // King (for variants)
+                'k': 'K',  // King (for variants)
+                'u': 'U',  // Unicorn (for variants)
+                'w': 'W',  // Wazir (for variants)
+                'f': 'F',  // Ferz (for variants)
+                'a': 'H',  // Archbishop (UCI: A → chess.com: H)
+                'c': 'E'   // Chancellor (UCI: C → chess.com: E)
             };
 
             const targetPiece = pieceMap[promotionPiece];
@@ -886,72 +1022,147 @@ class ChessComInterface:
                 '[class*="upgrade"]'
             ];
 
+            // Find the LARGEST visible promotion dialog (not hidden/minimized ones)
             let promotionDialog = null;
+            let largestArea = 0;
+
             for (const selector of dialogSelectors) {
                 const elements = document.querySelectorAll(selector);
                 for (const elem of elements) {
-                    // Find a visible container that likely contains promotion options
                     const rect = elem.getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0) {
+                    const area = rect.width * rect.height;
+
+                    // Must be visible and larger than what we've found
+                    if (area > largestArea && rect.width > 50 && rect.height > 50) {
                         promotionDialog = elem;
-                        break;
+                        largestArea = area;
                     }
                 }
-                if (promotionDialog) break;
             }
 
             if (!promotionDialog) {
-                return { error: 'Promotion dialog container not found' };
+                return { error: 'Promotion dialog container not found (no large visible dialogs)' };
             }
 
-            // Find pieces WITHIN the promotion dialog
-            const promotionPieces = promotionDialog.querySelectorAll('[data-piece]');
+            // LOG DIALOG DETAILS
+            const dialogRect = promotionDialog.getBoundingClientRect();
+            console.log('[Promotion] Dialog found:', {
+                class: promotionDialog.className,
+                rect: { x: dialogRect.left, y: dialogRect.top, w: dialogRect.width, h: dialogRect.height },
+                innerHTML: promotionDialog.innerHTML.substring(0, 300)
+            });
+
+            // Find pieces WITHIN the promotion dialog - try multiple selectors
+            let promotionPieces = promotionDialog.querySelectorAll('[data-piece]');
+
+            // If no pieces found, try alternative selectors
+            if (promotionPieces.length === 0) {
+                promotionPieces = promotionDialog.querySelectorAll('[class*="piece"]');
+            }
+            if (promotionPieces.length === 0) {
+                promotionPieces = promotionDialog.querySelectorAll('img[src*="piece"]');
+            }
+            if (promotionPieces.length === 0) {
+                promotionPieces = promotionDialog.querySelectorAll('div[role="button"]');
+            }
 
             if (promotionPieces.length === 0) {
                 return { error: 'No promotion pieces found in dialog' };
             }
 
-            // Find the matching piece and return its coordinates
+            // Debug: Log all available pieces with their actual positions
+            const availablePieces = Array.from(promotionPieces).map((p, idx) => {
+                const pRect = p.getBoundingClientRect();
+                return {
+                    index: idx,
+                    dataPiece: p.getAttribute('data-piece'),
+                    rect: { x: Math.round(pRect.left), y: Math.round(pRect.top), w: Math.round(pRect.width), h: Math.round(pRect.height) }
+                };
+            });
+            console.log('[Promotion] Available pieces:', availablePieces);
+            console.log('[Promotion] Looking for:', targetPiece);
+
+            // Find the matching piece
             for (const piece of promotionPieces) {
                 const dataPiece = piece.getAttribute('data-piece');
 
-                // Check if this is the piece we want
+                // ONLY match by data-piece attribute (exact match)
+                // This prevents false positives like 'H' matching "bisHop"
                 if (dataPiece === targetPiece) {
-                    const rect = piece.getBoundingClientRect();
-                    // Return center coordinates for clicking
+                    // Found the target piece! Use its ACTUAL bounding rect
+                    const pieceRect = piece.getBoundingClientRect();
+
+                    console.log('[Promotion] Found target piece:', {
+                        dataPiece,
+                        rect: { x: Math.round(pieceRect.left), y: Math.round(pieceRect.top), w: Math.round(pieceRect.width), h: Math.round(pieceRect.height) }
+                    });
+
+                    // Use the piece's actual position (trust getBoundingClientRect now that we have the right dialog!)
+                    const x = Math.round(pieceRect.left + pieceRect.width / 2);
+                    const y = Math.round(pieceRect.top + pieceRect.height / 2);
+
+                    console.log('[Promotion] Will click at piece center:', { x, y });
+
                     return {
                         found: true,
                         piece: targetPiece,
-                        element: piece.className,
-                        x: Math.round(rect.left + rect.width / 2),
-                        y: Math.round(rect.top + rect.height / 2)
+                        clickMethod: 'cdp',
+                        x: x,
+                        y: y
                     };
                 }
             }
+
+            // Not found
+            return {
+                found: false,
+                searched: targetPiece,
+                available: availablePieces.map(p => p.dataPiece).join(', ')
+            };
 
             // If exact match not found, return what we found for debugging
             return {
                 found: false,
                 searched: targetPiece,
-                available: Array.from(promotionPieces).map(p => p.getAttribute('data-piece')).join(', ')
+                available: availablePieces.join(', ')
             };
             """
 
             result = self.driver.execute_script(js_script, promotion_piece)
 
             if result.get('found'):
-                # Use CDP to click on the promotion piece (same as move execution)
+                # Use CDP to click on the promotion piece (creates trusted events)
                 x = result['x']
                 y = result['y']
 
+                print(f"[ChessCom] Clicking promotion piece at ({x}, {y})")
+                if 'debug' in result:
+                    print(f"[ChessCom] Piece size: {result['debug']['pieceWidth']}x{result['debug']['pieceHeight']}, Container: {result['debug']['containerWidth']}x{result['debug']['containerHeight']}")
+
+                # DEBUG: Check what element is at these coordinates
+                elem_at_coords = self.driver.execute_script(f"""
+                    const elem = document.elementFromPoint({x}, {y});
+                    if (!elem) return {{ error: 'No element at coordinates' }};
+
+                    const rect = elem.getBoundingClientRect();
+                    return {{
+                        tag: elem.tagName,
+                        class: elem.className,
+                        dataPiece: elem.getAttribute('data-piece'),
+                        rect: {{ x: rect.left, y: rect.top, w: rect.width, h: rect.height }},
+                        pointerEvents: window.getComputedStyle(elem).pointerEvents
+                    }};
+                """)
+                print(f"[ChessCom] Element at ({x}, {y}): {elem_at_coords}")
+
                 try:
-                    # Click using CDP (same reliable method as moves)
+                    # Click using CDP (creates trusted mouse events)
                     self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
                         'type': 'mouseMoved',
                         'x': x,
                         'y': y
                     })
-                    time.sleep(0.03)
+                    time.sleep(0.05)
 
                     self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
                         'type': 'mousePressed',
@@ -970,9 +1181,27 @@ class ChessComInterface:
                         'clickCount': 1
                     })
 
-                    time.sleep(0.2)  # Wait for promotion to process
-                    print(f"[ChessCom] ✓ Promoted to {result['piece']}")
-                    return True
+                    # Wait and verify the promotion dialog closed
+                    time.sleep(0.5)
+
+                    # Check if promotion dialog is still visible
+                    dialog_check = self.driver.execute_script("""
+                        const dialogs = document.querySelectorAll('[class*="promotion"]');
+                        for (const dialog of dialogs) {
+                            const rect = dialog.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {
+                                return { stillVisible: true };
+                            }
+                        }
+                        return { stillVisible: false };
+                    """)
+
+                    if dialog_check.get('stillVisible'):
+                        print(f"[ChessCom] ⚠ Promotion dialog still visible after click - promotion may have failed")
+                        return False
+                    else:
+                        print(f"[ChessCom] ✓ Promoted to {result['piece']} (CDP, dialog closed)")
+                        return True
 
                 except Exception as cdp_error:
                     print(f"[ChessCom] ✗ CDP click failed: {cdp_error}")
@@ -996,7 +1225,8 @@ class ChessComInterface:
 
         Handles both regular moves and drop moves (Crazyhouse/variants):
         - Regular moves: e2e4, d7d5, a7a8q (with promotion)
-        - Drop moves: N@g3, P@e5, Q@d8 (place piece from pocket)
+        - Drop moves: N@g3, P@e5, Q@d8, A@e1, C@d1 (place piece from pocket)
+          NOTE: UCI uses A/C for Archbishop/Chancellor, chess.com uses H/E
 
         This is the main entry point that tries multiple methods:
         1. Drop moves: make_drop_move (for piece placements)
@@ -1005,7 +1235,7 @@ class ChessComInterface:
         4. ActionChains (requires focus - last resort)
 
         Args:
-            uci_move: Move in UCI format (e.g., 'e2e4', 'd7d5', 'N@g3')
+            uci_move: Move in UCI format (e.g., 'e2e4', 'd7d5', 'N@g3', 'A@e1')
 
         Returns:
             bool: True if move was successful, False otherwise
@@ -1022,12 +1252,16 @@ class ChessComInterface:
                 print(f"[ChessCom] ✗ Invalid drop move format: {uci_move}")
                 return False
 
-        # Check if this is a promotion move (5 characters: e7e8q)
+        # Parse the move to detect promotion (works with any board size)
+        parsed_move = UCIHandler.parse_uci_move(uci_move)
+
         promotion_piece = None
         base_move = uci_move
-        if len(uci_move) == 5:
-            promotion_piece = uci_move[4]
-            base_move = uci_move[:4]
+
+        if parsed_move and parsed_move.get('type') == 'normal' and parsed_move.get('promotion'):
+            promotion_piece = parsed_move['promotion']
+            # Reconstruct base move without promotion
+            base_move = parsed_move['from'] + parsed_move['to']
             print(f"[ChessCom] Promotion move detected: {base_move} → {promotion_piece.upper()}")
 
         # Regular move - try CDP first (works in background)
@@ -1060,7 +1294,7 @@ class ChessComInterface:
         This is the fallback method when JavaScript dispatch doesn't work.
 
         Args:
-            uci_move: Move in UCI format (e.g., 'e2e4', 'd7d5')
+            uci_move: Move in UCI format (e.g., 'e2e4', 'd7d5', 'g14n7')
 
         Returns:
             bool: True if move was successful, False otherwise
@@ -1072,9 +1306,14 @@ class ChessComInterface:
             # Check whose turn it is
             turn = self.get_turn()
 
-            # Parse UCI move
-            from_square = uci_move[:2]
-            to_square = uci_move[2:4]
+            # Parse UCI move properly (handles multi-digit ranks)
+            parsed = UCIHandler.parse_uci_move(uci_move)
+            if not parsed or parsed.get('type') != 'normal':
+                print(f"[ChessCom] ✗ Invalid move format: {uci_move}")
+                return False
+
+            from_square = parsed['from']
+            to_square = parsed['to']
 
             # Get coordinates for both squares
             from_coords = self.get_square_coordinates(from_square)
@@ -1151,7 +1390,8 @@ class ChessComInterface:
         Get the coordinates of a piece in the pocket (captured pieces in hand).
 
         Args:
-            piece_type: Single letter piece type (Q, R, N, B, P)
+            piece_type: Single letter piece type (Q, R, N, B, P, U, W, F, A, C)
+                       UCI: A=Archbishop, C=Chancellor (chess.com: H, E)
             player_color: 'white' or 'black', or None to auto-detect
 
         Returns:
@@ -1161,16 +1401,35 @@ class ChessComInterface:
         if not player_color:
             player_color = self.get_player_color()
 
+        # Convert UCI notation to chess.com notation
+        # UCI: A=Archbishop, C=Chancellor → chess.com: H, E
+        uci_to_chesscom = {
+            'A': 'H',  # Archbishop
+            'C': 'E'   # Chancellor
+        }
+
+        # Use chess.com notation if piece is A or C, otherwise use as-is
+        chesscom_piece = uci_to_chesscom.get(piece_type.upper(), piece_type.upper())
+
+        if piece_type.upper() != chesscom_piece:
+            print(f"[ChessCom] Converting UCI {piece_type.upper()} → chess.com {chesscom_piece}")
+
         # Map piece type to full name for Chess.com's class naming
+        # NOTE: UCI uses A/C for Archbishop/Chancellor, but chess.com uses H/E
         piece_map = {
             'Q': 'queen',
             'R': 'rook',
             'N': 'knight',
             'B': 'bishop',
-            'P': 'pawn'
+            'P': 'pawn',
+            'U': 'unicorn',
+            'W': 'wazir',
+            'F': 'ferz',
+            'H': 'archbishop',  # chess.com notation
+            'E': 'chancellor'   # chess.com notation
         }
 
-        piece_name = piece_map.get(piece_type.upper())
+        piece_name = piece_map.get(chesscom_piece)
         if not piece_name:
             print(f"[ChessCom] ✗ Unknown piece type: {piece_type}")
             return None
@@ -1178,7 +1437,7 @@ class ChessComInterface:
         # Chess.com uses data-piece attribute (e.g., data-piece="P")
         # and positions pieces to the LEFT of the board for pockets
         js_script = f"""
-        const pieceType = '{piece_type.upper()}';
+        const pieceType = '{chesscom_piece}';  // Use chess.com notation (H/E, not A/C)
         const playerColor = '{player_color}';
 
         // Step 1: Find the board position
@@ -1191,6 +1450,23 @@ class ChessComInterface:
         }}
 
         const boardRect = board.getBoundingClientRect();
+
+        // DEBUG: Find ALL pocket pieces to see what's available
+        const allPocketElements = document.querySelectorAll('[class*="pocket"] [data-piece]');
+        const debugPocketPieces = [];
+        for (const elem of allPocketElements) {{
+            const dataPiece = elem.getAttribute('data-piece');
+            const rect = elem.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {{
+                debugPocketPieces.push({{
+                    dataPiece: dataPiece,
+                    className: elem.className,
+                    rect: {{ x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) }}
+                }});
+            }}
+        }}
+        console.log('[PocketDrop] All pocket pieces found:', debugPocketPieces);
+        console.log('[PocketDrop] Searching for piece type:', pieceType);
 
         // Step 2: Find all pieces with matching data-piece attribute
         const allPieces = document.querySelectorAll(`[data-piece="${{pieceType}}"]`);
@@ -1299,7 +1575,8 @@ class ChessComInterface:
         Execute a drop move (place a piece from pocket onto the board).
 
         Args:
-            piece_type: Single letter piece type (Q, R, N, B, P)
+            piece_type: Single letter piece type (Q, R, N, B, P, U, W, F, A, C)
+                       UCI: A=Archbishop, C=Chancellor (chess.com: H, E)
             to_square: Destination square in UCI format (e.g., 'g3', 'e5')
 
         Returns:

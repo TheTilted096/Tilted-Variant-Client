@@ -9,6 +9,7 @@ class UCIHandler:
     def validate_uci_move(move):
         """
         Validate a UCI move format (regular or drop).
+        Supports various board sizes: 4x4, 6x6, 8x8, 10x8, 14x14, etc.
 
         Args:
             move: String move in UCI format
@@ -16,15 +17,17 @@ class UCIHandler:
         Returns:
             bool: True if valid UCI format, False otherwise
         """
-        # Regular UCI move pattern: e2e4, a7a8q (with promotion)
-        # For standard variants: source square (2 chars) + destination square (2 chars) + optional promotion
-        # Promotion pieces: q, r, b, n, k (king for variants like Racing Kings)
-        regular_pattern = r'^[a-h][1-8][a-h][1-8][qrbnk]?$'
+        # Regular UCI move pattern: e2e4, a7a8q, j1j8 (with promotion)
+        # For all board sizes: source square + destination square + optional promotion
+        # Files: a-n (supports up to 14 files)
+        # Ranks: 1-14 (supports up to 14 ranks)
+        # Promotion pieces: q, r, b, n, k, u, w, f, a, c (variants: Unicorn, Wazir, Ferz, Archbishop, Chancellor)
+        regular_pattern = r'^[a-n][1-9][0-4]?[a-n][1-9][0-4]?[qrbnkuwfac]?$'
 
         # Drop move pattern for Crazyhouse/variants: P@e5, N@g3, Q@d8, etc.
-        # Format: <PIECE>@<square> where PIECE is Q, R, N, B, or P
+        # Format: <PIECE>@<square> where PIECE is Q, R, N, B, P, U, W, F, A, C
         # Pattern is case-insensitive for squares
-        drop_pattern = r'^[QRNBPqrnbp]@[a-hA-H][1-8]$'
+        drop_pattern = r'^[QRNBPUWFACqrnbpuwfac]@[a-nA-N][1-9][0-4]?$'
 
         move_lower = move.lower()
 
@@ -34,9 +37,10 @@ class UCIHandler:
     def parse_uci_move(move):
         """
         Parse a UCI move string (regular or drop move).
+        Supports various board sizes with multi-digit ranks (e.g., 'e10e12').
 
         Args:
-            move: String move in UCI format (e.g., 'e2e4' or 'N@g3')
+            move: String move in UCI format (e.g., 'e2e4', 'j10j8', or 'N@g3')
 
         Returns:
             dict: Parsed move with keys:
@@ -65,13 +69,24 @@ class UCIHandler:
                 'to': square
             }
         else:
-            # Regular move: e2e4, a7a8q, etc.
+            # Regular move: e2e4, a7a8q, j10j12, etc.
             move_lower = move.lower()
+
+            # Parse using regex to handle multi-digit ranks
+            # Pattern: <file><rank><file><rank><promotion?>
+            pattern = r'^([a-n])([1-9][0-4]?)([a-n])([1-9][0-4]?)([qrbnkuwfac]?)$'
+            match = re.match(pattern, move_lower)
+
+            if not match:
+                return None
+
+            from_file, from_rank, to_file, to_rank, promotion = match.groups()
+
             return {
                 'type': 'normal',
-                'from': move_lower[:2],
-                'to': move_lower[2:4],
-                'promotion': move_lower[4] if len(move_lower) == 5 else None
+                'from': from_file + from_rank,
+                'to': to_file + to_rank,
+                'promotion': promotion if promotion else None
             }
 
         return None
@@ -99,7 +114,12 @@ class UCIHandler:
                 'R': 'Rook',
                 'N': 'Knight',
                 'B': 'Bishop',
-                'P': 'Pawn'
+                'P': 'Pawn',
+                'U': 'Unicorn',
+                'W': 'Wazir',
+                'F': 'Ferz',
+                'A': 'Archbishop',
+                'C': 'Chancellor'
             }.get(move_dict['piece'], move_dict['piece'])
             return f"Drop {piece_name} @ {move_dict['to']}"
         else:
