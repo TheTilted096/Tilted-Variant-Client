@@ -74,20 +74,62 @@ class ChessComInterface:
             print(f"[ChessCom] Error detecting turn: {e}")
             return 'unknown'
 
-    def get_player_color(self):
+    def get_board_orientation(self):
         """
-        Detect which color the user is playing as.
+        Detect the board's orientation (which rank is at the top).
 
-        Chess.com-specific detection using coordinate labels.
-        Falls back to CSS classes if labels not found.
+        This is SEPARATE from player color - in variants like Racing Kings,
+        both colors can be on the bottom ranks.
 
         Returns:
-            str: 'white', 'black', or 'unknown'
+            dict: {
+                'is_flipped': bool,  # True if rank 1 at top (black perspective)
+                'method': str,        # How it was detected
+                'detail': str,        # Human-readable detail
+                'debug': dict         # Debug info
+            }
         """
         import time
 
         js_script = """
-        // Quick check: coordinate labels (works on chess.com)
+        const debug = { allLabels: [], nearLabels: [], boardInfo: null };
+
+        // STEP 1: Find the MAIN game board
+        const board = document.querySelector('.TheBoard-squares') ||
+                     document.querySelector('[class*="Board-squares"]') ||
+                     document.querySelector('.board') ||
+                     document.querySelector('[class*="board"]');
+
+        if (!board) {
+            return {
+                is_flipped: false,
+                method: 'none',
+                detail: 'board element not found',
+                debug: debug
+            };
+        }
+
+        const boardRect = board.getBoundingClientRect();
+        debug.boardInfo = {
+            top: Math.round(boardRect.top),
+            left: Math.round(boardRect.left),
+            width: Math.round(boardRect.width),
+            height: Math.round(boardRect.height),
+            hasFlippedClass: board.classList.contains('flipped')
+        };
+
+        // METHOD 1: Check for 'flipped' CSS class (like Wilted-Chess-Client)
+        if (board.classList.contains('flipped')) {
+            return {
+                is_flipped: true,
+                method: 'css-class',
+                detail: 'board has "flipped" class',
+                debug: debug
+            };
+        }
+
+        // METHOD 2: Analyze coordinate labels
+        const margin = 40; // Coordinate labels are right next to the board
         const allElements = Array.from(document.querySelectorAll('*'));
         const coordinates = [];
 
@@ -98,124 +140,178 @@ class ChessComInterface:
                 const rect = el.getBoundingClientRect();
 
                 if (rect.width > 0 && rect.height > 0) {
-                    coordinates.push({
+                    const className = String(el.className || '').toLowerCase();
+                    const labelInfo = {
                         text: text,
-                        top: rect.top
-                    });
+                        top: Math.round(rect.top),
+                        left: Math.round(rect.left),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                        className: el.className
+                    };
+
+                    // Track ALL labels for debugging
+                    debug.allLabels.push(labelInfo);
+
+                    // FILTER 1: Exclude UI elements (notifications, icons, badges)
+                    const isUIElement = className.includes('notification') ||
+                                       className.includes('icon') ||
+                                       className.includes('badge') ||
+                                       className.includes('button') ||
+                                       className.includes('menu');
+
+                    if (isUIElement) {
+                        labelInfo.excluded = 'UI element';
+                        continue;
+                    }
+
+                    // FILTER 2: Must be near the board (within 40px)
+                    const nearBoard =
+                        Math.abs(rect.left - boardRect.left) < margin ||
+                        Math.abs(rect.right - boardRect.right) < margin ||
+                        Math.abs(rect.top - boardRect.top) < margin ||
+                        Math.abs(rect.bottom - boardRect.bottom) < margin;
+
+                    if (nearBoard) {
+                        debug.nearLabels.push(labelInfo);
+                        coordinates.push({
+                            text: text,
+                            top: rect.top,
+                            left: rect.left
+                        });
+                    }
                 }
             }
         }
 
+        // Determine orientation from topmost label near board
         if (coordinates.length >= 2) {
             coordinates.sort((a, b) => a.top - b.top);
             const topmost = coordinates[0];
+            const bottommost = coordinates[coordinates.length - 1];
+
+            debug.topmost = { text: topmost.text, top: Math.round(topmost.top) };
+            debug.bottommost = { text: bottommost.text, top: Math.round(bottommost.top) };
 
             if (topmost.text === '1') {
-                return { color: 'black', method: 'coordinate labels', detail: 'rank 1 at top' };
+                return {
+                    is_flipped: true,
+                    method: 'coordinate-labels',
+                    detail: 'rank 1 at top (black perspective)',
+                    debug: debug
+                };
             } else if (topmost.text === '8') {
-                return { color: 'white', method: 'coordinate labels', detail: 'rank 8 at top' };
+                return {
+                    is_flipped: false,
+                    method: 'coordinate-labels',
+                    detail: 'rank 8 at top (white perspective)',
+                    debug: debug
+                };
             }
         }
 
-        // Fallback: CSS class check
-        const boardElements = document.querySelectorAll('.board, [class*="Board"]');
-        for (let el of boardElements) {
-            const className = el.className.toString().toLowerCase();
-
-            // Skip wrappers/containers
-            if (className.includes('wrapper') || className.includes('container') || className.includes('layout')) {
-                continue;
-            }
-
-            if (className.includes('flipped') || className.includes('flip')) {
-                return { color: 'black', method: 'CSS class', detail: 'flipped class found' };
-            }
-
-            // Check data attributes
-            if (el.dataset.orientation === 'black' || el.dataset.flipped === 'true') {
-                return { color: 'black', method: 'data attribute', detail: 'orientation=black' };
-            }
-            if (el.dataset.orientation === 'white') {
-                return { color: 'white', method: 'data attribute', detail: 'orientation=white' };
-            }
-        }
-
-        return { color: 'unknown', method: 'none', detail: 'no indicators found' };
-        """
-
-        # Retry up to 3 times with short delays (for page loading)
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                result = self.driver.execute_script(js_script)
-                color = result['color']
-
-                if color != 'unknown':
-                    method = result['method']
-                    detail = result['detail']
-                    print(f"[ChessCom] Side: {color.upper()} ({method}: {detail})")
-                    return color
-
-                # Unknown - wait and retry
-                if attempt < max_retries - 1:
-                    time.sleep(0.2)  # Short delay for page to render
-
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    time.sleep(0.2)
-                else:
-                    print(f"[ChessCom] Error detecting player color: {e}")
-                    return 'unknown'
-
-        print(f"[ChessCom] ⚠ Could not detect side after {max_retries} attempts")
-        return 'unknown'
-
-    def is_board_flipped(self):
-        """
-        Detect if the board is flipped (Black on bottom).
-
-        Returns:
-            bool: True if board is flipped (playing as Black), False otherwise
-        """
-        player_color = self.get_player_color()
-
-        # If playing as black, board should be flipped
-        if player_color == 'black':
-            return True
-        elif player_color == 'white':
-            return False
-
-        # Fallback to direct flipped detection
-        js_script = """
-        // Check for flipped class
-        const board = document.querySelector('.TheBoard-squares') ||
-                     document.querySelector('[class*="Board-squares"]') ||
-                     document.querySelector('.board') ||
-                     document.querySelector('[class*="board"]');
-
-        if (board && board.className.includes('flipped')) {
-            return true;
-        }
-
-        // Check coordinates if visible
-        const coordSquares = document.querySelectorAll('[class*="coordinate"]');
-        for (let coord of coordSquares) {
-            if (coord.textContent === '1' && coord.className.includes('top')) {
-                return true; // rank 1 on top means flipped
-            }
-        }
-
-        // Default to not flipped (White on bottom)
-        return false;
+        // Fallback: assume not flipped
+        return {
+            is_flipped: false,
+            method: 'default',
+            detail: 'assumed not flipped (no labels found)',
+            debug: debug
+        };
         """
 
         try:
-            is_flipped = self.driver.execute_script(js_script)
-            print(f"[ChessCom] Board flipped (fallback detection): {is_flipped}")
-            return is_flipped
+            result = self.driver.execute_script(js_script)
+            is_flipped = result.get('is_flipped', False)
+            method = result.get('method', 'unknown')
+            detail = result.get('detail', '')
+            debug = result.get('debug', {})
+
+            # Print detailed debug info
+            print(f"\n{'='*60}")
+            print(f"[Board Orientation Debug]")
+            print(f"{'='*60}")
+
+            board_info = debug.get('boardInfo')
+            if board_info:
+                print(f"Board element:")
+                print(f"  Position: ({board_info['left']}, {board_info['top']})")
+                print(f"  Size: {board_info['width']}x{board_info['height']}")
+                print(f"  Has 'flipped' class: {board_info['hasFlippedClass']}")
+
+            all_labels = debug.get('allLabels', [])
+            print(f"\nAll '1' or '8' labels found: {len(all_labels)}")
+            for i, label in enumerate(all_labels[:10], 1):  # Show first 10
+                class_name = str(label.get('className', ''))[:40]
+                excluded = label.get('excluded', '')
+                status = f" [EXCLUDED: {excluded}]" if excluded else ""
+                print(f"  {i}. '{label['text']}' at ({label['left']}, {label['top']}) "
+                      f"[{label['width']}x{label['height']}] class='{class_name}'{status}")
+            if len(all_labels) > 10:
+                print(f"  ... and {len(all_labels) - 10} more")
+
+            near_labels = debug.get('nearLabels', [])
+            print(f"\nLabels NEAR board (within 40px): {len(near_labels)}")
+            for i, label in enumerate(near_labels, 1):
+                print(f"  {i}. '{label['text']}' at ({label['left']}, {label['top']})")
+
+            topmost = debug.get('topmost')
+            bottommost = debug.get('bottommost')
+            if topmost and bottommost:
+                print(f"\nTopmost label: '{topmost['text']}' at y={topmost['top']}")
+                print(f"Bottommost label: '{bottommost['text']}' at y={bottommost['top']}")
+
+            print(f"\n{'─'*60}")
+            print(f"🎯 Board Orientation: {'FLIPPED' if is_flipped else 'NORMAL'} ({method})")
+            print(f"   Detail: {detail}")
+
+            # Show inferred player color (works for standard chess)
+            player_color = 'BLACK' if is_flipped else 'WHITE'
+            player_emoji = '♟️' if is_flipped else '♙'
+            print(f"{player_emoji}  Player Color (inferred): {player_color}")
+            print(f"{'='*60}\n")
+
+            return result
+
         except Exception as e:
-            print(f"[ChessCom] Error detecting board orientation: {e}")
-            return False  # Default to not flipped
+            print(f"[Board] Error detecting orientation: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                'is_flipped': False,
+                'method': 'error',
+                'detail': str(e),
+                'debug': {}
+            }
+
+    def get_player_color(self):
+        """
+        Detect which color the user is playing as.
+
+        NOTE: In standard chess, this is the same as board orientation.
+        But in variants (Racing Kings, etc.), it might be different.
+
+        Returns:
+            str: 'white', 'black', or 'unknown'
+        """
+        # For now, infer from board orientation (works for standard chess)
+        orientation = self.get_board_orientation()
+
+        if orientation['is_flipped']:
+            print(f"♟️  [Player Color] You are playing: BLACK")
+            return 'black'
+        else:
+            print(f"♙  [Player Color] You are playing: WHITE")
+            return 'white'
+
+    def is_board_flipped(self):
+        """
+        Detect if the board is flipped (rank 1 at top).
+
+        Returns:
+            bool: True if board is flipped, False otherwise
+        """
+        orientation = self.get_board_orientation()
+        return orientation['is_flipped']
 
     def debug_board(self):
         """Debug helper to inspect the board structure."""
@@ -249,13 +345,15 @@ class ChessComInterface:
             print(f"[Debug] Error inspecting board: {e}")
             return None
 
-    def get_square_coordinates(self, square):
+    def get_square_coordinates(self, square, is_flipped=None):
         """
         Get the pixel coordinates of a square on the chess.com board.
         Automatically adjusts for board flip (playing as Black).
 
         Args:
             square: Square in UCI format (e.g., 'e2', 'd4')
+            is_flipped: Optional pre-computed board flip state (True/False).
+                       If None, will detect automatically.
 
         Returns:
             dict: {'x': x_coord, 'y': y_coord} or None if not found
@@ -266,8 +364,9 @@ class ChessComInterface:
         # Convert file letter to number (a=1, b=2, ..., h=8)
         file_num = ord(file_letter) - ord('a') + 1
 
-        # Detect board orientation
-        is_flipped = self.is_board_flipped()
+        # Detect board orientation (only if not provided)
+        if is_flipped is None:
+            is_flipped = self.is_board_flipped()
 
         js_script = f"""
         // Find the chess board
@@ -350,9 +449,12 @@ class ChessComInterface:
 
             print(f"[ChessCom] Move: {from_square} → {to_square}")
 
-            # Get coordinates for both squares
-            from_coords = self.get_square_coordinates(from_square)
-            to_coords = self.get_square_coordinates(to_square)
+            # Detect board orientation once (cache for this move)
+            is_flipped = self.is_board_flipped()
+
+            # Get coordinates for both squares (pass cached flip state)
+            from_coords = self.get_square_coordinates(from_square, is_flipped)
+            to_coords = self.get_square_coordinates(to_square, is_flipped)
 
             if not from_coords or not to_coords:
                 print(f"[ChessCom] ✗ Could not find board squares")
