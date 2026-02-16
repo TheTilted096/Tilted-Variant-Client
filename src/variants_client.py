@@ -69,36 +69,39 @@ class VariantsClient:
         print("=" * 60)
         print("Commands:")
         print("  - Enter UCI move (e.g., 'e2e4', 'd2d3')")
-        print("  - 'debug' - Inspect board structure (troubleshooting)")
+        print("  - Enter drop move (e.g., 'N@g3', 'P@e5') for Crazyhouse/variants")
+        print("  - Enter promotion move (e.g., 'h2h1r', 'a7a8q')")
+        print("  - 'debug' - Inspect board structure")
+        print("  - 'debug-pocket' - Inspect pocket/reserve pieces")
+        print("  - 'debug-promotion' - Inspect promotion dialog (run when dialog is open)")
         print("  - 'quit' - Exit the client")
         print("=" * 60)
         print()
 
         while self.running:
             try:
-                # Get user input
-                user_input = input("Enter move (UCI): ").strip().lower()
+                # Get user input (preserve case for drop moves like N@g3)
+                user_input = input("Enter move (UCI): ").strip()
+
+                # Only lowercase for commands, not for moves (need uppercase for drops)
+                command = user_input.lower()
 
                 if not user_input:
                     continue
 
-                # Handle commands
-                if user_input == 'quit':
+                # Handle commands (use lowercase version)
+                if command == 'quit':
                     print("[Client] Exiting...")
                     break
 
-                if user_input == 'debug':
-                    print("[Client] Inspecting board structure...")
-                    self.chesscom_interface.debug_board()
-                    print()
-                    continue
-
-                # Try to parse as UCI move
+                # Try to parse as UCI move (preserve original case for drop moves)
                 parsed_move = UCIHandler.parse_uci_move(user_input)
 
                 if not parsed_move:
                     print(f"[Error] Invalid UCI move format: {user_input}")
-                    print("[Help] Expected format: e2e4 (source square + destination square)")
+                    print("[Help] Expected formats:")
+                    print("[Help]   - Regular move: e2e4 (source + destination)")
+                    print("[Help]   - Drop move: N@g3 (piece type + @ + square)")
                     print()
                     continue
 
@@ -113,8 +116,8 @@ class VariantsClient:
                     print("[Success] Move executed!")
                 else:
                     print("[Error] Failed to execute move on chess.com")
-                    print("[Help] Try running 'debug' to inspect the board structure")
                     print("[Help] Make sure you're in an active game on the board")
+                    print("[Help] Check the browser window for any dialogs or alerts")
 
                 print()
 
