@@ -264,10 +264,49 @@ class ChessComInterface:
             print(f"🎯 Board Orientation: {'FLIPPED' if is_flipped else 'NORMAL'} ({method})")
             print(f"   Detail: {detail}")
 
-            # Show inferred player color (works for standard chess)
-            player_color = 'BLACK' if is_flipped else 'WHITE'
-            player_emoji = '♟️' if is_flipped else '♙'
-            print(f"{player_emoji}  Player Color (inferred): {player_color}")
+            # Add player color detection
+            try:
+                username = self.get_username_from_page()
+                if username:
+                    # Detect color without printing full debug output
+                    js_script = f"""
+                    const username = "{username}";
+                    const topBox = document.querySelector('.playerbox-top');
+                    const bottomBox = document.querySelector('.playerbox-bottom');
+
+                    // Check top box
+                    if (topBox) {{
+                        const userTag = topBox.querySelector('.playerbox-user-tag');
+                        if (userTag && userTag.textContent.includes(username)) {{
+                            const playerDiv = topBox.querySelector('[data-player]');
+                            return playerDiv ? playerDiv.getAttribute('data-player') : null;
+                        }}
+                    }}
+
+                    // Check bottom box
+                    if (bottomBox) {{
+                        const userTag = bottomBox.querySelector('.playerbox-user-tag');
+                        if (userTag && userTag.textContent.includes(username)) {{
+                            const playerDiv = bottomBox.querySelector('[data-player]');
+                            return playerDiv ? playerDiv.getAttribute('data-player') : null;
+                        }}
+                    }}
+
+                    return null;
+                    """
+                    data_player = self.driver.execute_script(js_script)
+
+                    if data_player == "0":
+                        print(f"♙  Your Color: WHITE (username: {username})")
+                    elif data_player == "2":
+                        print(f"♟️  Your Color: BLACK (username: {username})")
+                    else:
+                        print(f"❓ Your Color: Unknown (username: {username}, data-player: {data_player})")
+                else:
+                    print(f"❓ Your Color: Unknown (could not detect username)")
+            except Exception as e:
+                print(f"❓ Your Color: Unknown (error: {e})")
+
             print(f"{'='*60}\n")
 
             return result
@@ -283,25 +322,278 @@ class ChessComInterface:
                 'debug': {}
             }
 
-    def get_player_color(self):
+    def get_username_from_page(self):
+        """
+        Extract the user's username from the page (status bar).
+
+        Returns:
+            str: Username or None if not found
+        """
+        js_script = """
+        const statusBarUsername = document.querySelector('.status-bar-username');
+        if (statusBarUsername) {
+            return statusBarUsername.textContent.trim();
+        }
+        return null;
+        """
+
+        try:
+            username = self.driver.execute_script(js_script)
+            if username:
+                print(f"[Player] Detected username: {username}")
+                return username
+            else:
+                print("[Player] Warning: Could not find username in status bar")
+                return None
+        except Exception as e:
+            print(f"[Player] Error detecting username: {e}")
+            return None
+
+    def get_player_position(self, username):
+        """
+        Find which playerbox (top or bottom) contains the given username.
+
+        Args:
+            username: The username to search for
+
+        Returns:
+            str: 'top', 'bottom', or 'unknown'
+        """
+        js_script = f"""
+        const username = "{username}";
+
+        // Find playerboxes
+        const topBox = document.querySelector('.playerbox-top');
+        const bottomBox = document.querySelector('.playerbox-bottom');
+
+        // Check top box
+        if (topBox) {{
+            const topUserTag = topBox.querySelector('.playerbox-user-tag');
+            if (topUserTag && topUserTag.textContent.includes(username)) {{
+                return 'top';
+            }}
+        }}
+
+        // Check bottom box
+        if (bottomBox) {{
+            const bottomUserTag = bottomBox.querySelector('.playerbox-user-tag');
+            if (bottomUserTag && bottomUserTag.textContent.includes(username)) {{
+                return 'bottom';
+            }}
+        }}
+
+        return 'unknown';
+        """
+
+        try:
+            position = self.driver.execute_script(js_script)
+            print(f"[Player] Username '{username}' found in {position} playerbox")
+            return position
+        except Exception as e:
+            print(f"[Player] Error finding player position: {e}")
+            return 'unknown'
+
+    def detect_piece_colors(self):
+        """
+        Analyze the board to determine where white and black pieces are located.
+
+        This looks at piece positions to determine which ranks have white pieces
+        and which have black pieces. In standard chess:
+        - White pieces start on ranks 1-2
+        - Black pieces start on ranks 7-8
+
+        Returns:
+            dict: {
+                'white_ranks': list,  # Ranks where white pieces are concentrated
+                'black_ranks': list,  # Ranks where black pieces are concentrated
+                'confidence': str     # 'high', 'medium', 'low'
+            }
+        """
+        js_script = """
+        // Find all pieces on the board
+        const pieces = document.querySelectorAll('[class*="piece"]');
+
+        if (pieces.length === 0) {
+            return { white_ranks: [], black_ranks: [], confidence: 'low', error: 'No pieces found' };
+        }
+
+        // Count pieces by color and rank
+        const whitePieces = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0 };
+        const blackPieces = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0 };
+
+        pieces.forEach(piece => {
+            const classes = piece.className;
+
+            // Piece classes are like "piece wp" (white pawn), "piece bn" (black knight), etc.
+            // First letter after 'piece' indicates color: w=white, b=black
+            const isWhite = classes.includes(' w') || classes.includes('white');
+            const isBlack = classes.includes(' b') || classes.includes('black');
+
+            // Try to determine which square this piece is on
+            // Check parent square element
+            let square = piece.parentElement;
+            while (square && !square.className.includes('square')) {
+                square = square.parentElement;
+            }
+
+            if (square) {
+                // Square classes often include the square name like "square-11" (a1), "square-88" (h8)
+                // Format is typically "square-<file><rank>" where file=1-8 (a-h), rank=1-8
+                const match = square.className.match(/square-(\\d)(\\d)/);
+                if (match) {
+                    const rank = parseInt(match[2]);  // Second digit is the rank
+
+                    if (isWhite) {
+                        whitePieces[rank]++;
+                    } else if (isBlack) {
+                        blackPieces[rank]++;
+                    }
+                }
+            }
+        });
+
+        // Find ranks with most white and black pieces
+        const whiteRanks = Object.entries(whitePieces)
+            .filter(([rank, count]) => count > 0)
+            .map(([rank, count]) => ({ rank: parseInt(rank), count }))
+            .sort((a, b) => b.count - a.count)
+            .map(item => item.rank);
+
+        const blackRanks = Object.entries(blackPieces)
+            .filter(([rank, count]) => count > 0)
+            .map(([rank, count]) => ({ rank: parseInt(rank), count }))
+            .sort((a, b) => b.count - a.count)
+            .map(item => item.rank);
+
+        // Determine confidence
+        let confidence = 'low';
+        if (whiteRanks.length >= 2 && blackRanks.length >= 2) {
+            confidence = 'high';
+        } else if (whiteRanks.length >= 1 && blackRanks.length >= 1) {
+            confidence = 'medium';
+        }
+
+        return {
+            white_ranks: whiteRanks,
+            black_ranks: blackRanks,
+            confidence: confidence,
+            debug: {
+                total_pieces: pieces.length,
+                white_pieces: whitePieces,
+                black_pieces: blackPieces
+            }
+        };
+        """
+
+        try:
+            result = self.driver.execute_script(js_script)
+
+            print(f"[Pieces] Detection confidence: {result.get('confidence', 'unknown')}")
+            print(f"[Pieces] White pieces on ranks: {result.get('white_ranks', [])}")
+            print(f"[Pieces] Black pieces on ranks: {result.get('black_ranks', [])}")
+
+            if result.get('error'):
+                print(f"[Pieces] Warning: {result['error']}")
+
+            return result
+        except Exception as e:
+            print(f"[Pieces] Error detecting piece colors: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'white_ranks': [], 'black_ranks': [], 'confidence': 'low'}
+
+    def get_player_color(self, username=None):
         """
         Detect which color the user is playing as.
 
-        NOTE: In standard chess, this is the same as board orientation.
-        But in variants (Racing Kings, etc.), it might be different.
+        Uses the data-player attribute in playerbox elements:
+        - data-player="0" indicates White
+        - data-player="2" indicates Black
+
+        Args:
+            username: Optional username to use. If None, will auto-detect from page.
 
         Returns:
             str: 'white', 'black', or 'unknown'
         """
-        # For now, infer from board orientation (works for standard chess)
-        orientation = self.get_board_orientation()
+        print(f"\n{'='*60}")
+        print(f"[Player Color Detection]")
+        print(f"{'='*60}")
 
-        if orientation['is_flipped']:
-            print(f"♟️  [Player Color] You are playing: BLACK")
-            return 'black'
-        else:
-            print(f"♙  [Player Color] You are playing: WHITE")
-            return 'white'
+        # Step 1: Get username
+        if not username:
+            username = self.get_username_from_page()
+
+        if not username:
+            print("[Player] ⚠ Could not determine username")
+            return 'unknown'
+
+        # Step 2: Find username's playerbox and get data-player attribute
+        js_script = f"""
+        const username = "{username}";
+        const topBox = document.querySelector('.playerbox-top');
+        const bottomBox = document.querySelector('.playerbox-bottom');
+
+        // Check top box
+        if (topBox) {{
+            const userTag = topBox.querySelector('.playerbox-user-tag');
+            if (userTag && userTag.textContent.includes(username)) {{
+                const playerDiv = topBox.querySelector('[data-player]');
+                const dataPlayer = playerDiv ? playerDiv.getAttribute('data-player') : null;
+                return {{ position: 'top', dataPlayer: dataPlayer }};
+            }}
+        }}
+
+        // Check bottom box
+        if (bottomBox) {{
+            const userTag = bottomBox.querySelector('.playerbox-user-tag');
+            if (userTag && userTag.textContent.includes(username)) {{
+                const playerDiv = bottomBox.querySelector('[data-player]');
+                const dataPlayer = playerDiv ? playerDiv.getAttribute('data-player') : null;
+                return {{ position: 'bottom', dataPlayer: dataPlayer }};
+            }}
+        }}
+
+        return {{ position: 'unknown', dataPlayer: null }};
+        """
+
+        try:
+            result = self.driver.execute_script(js_script)
+            position = result.get('position', 'unknown')
+            data_player = result.get('dataPlayer')
+
+            print(f"[Player] Username: {username}")
+            print(f"[Player] Position: {position} playerbox")
+            print(f"[Player] data-player attribute: {data_player}")
+
+            # Map data-player to color
+            # data-player="0" = White
+            # data-player="2" = Black
+            user_color = 'unknown'
+
+            if data_player == "0":
+                user_color = 'white'
+            elif data_player == "2":
+                user_color = 'black'
+            else:
+                print(f"[Player] ⚠ Unexpected data-player value: {data_player}")
+
+            print(f"\n{'─'*60}")
+            if user_color == 'white':
+                print(f"♙  [Player Color] You are playing: WHITE")
+            elif user_color == 'black':
+                print(f"♟️  [Player Color] You are playing: BLACK")
+            else:
+                print(f"❓ [Player Color] Could not determine (unknown)")
+            print(f"{'='*60}\n")
+
+            return user_color
+
+        except Exception as e:
+            print(f"[Player] ✗ Error detecting color: {e}")
+            import traceback
+            traceback.print_exc()
+            return 'unknown'
 
     def is_board_flipped(self):
         """
