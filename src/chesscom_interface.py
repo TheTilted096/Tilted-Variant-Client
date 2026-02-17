@@ -71,24 +71,35 @@ class ChessComInterface:
             const rect = el.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) continue;
 
-            // Check if element is near the board
-            const nearBoard = (
-                Math.abs(rect.left - boardRect.right) < margin ||
-                Math.abs(rect.right - boardRect.left) < margin ||
-                Math.abs(rect.top - boardRect.bottom) < margin ||
-                Math.abs(rect.bottom - boardRect.top) < margin
-            );
-
-            if (!nearBoard) continue;
-
-            // Check for file letters (a-z)
-            if (/^[a-z]$/.test(text)) {
-                fileLetters.add(text);
+            // Skip elements inside pockets, material counters, player info, etc.
+            // Use String() to handle SVGAnimatedString and other non-string className types
+            const className = String(el.className || '');
+            const parentClasses = String(el.parentElement?.className || '');
+            const skipPatterns = ['pocket', 'material', 'player', 'captured', 'score', 'clock', 'timer'];
+            if (skipPatterns.some(pattern =>
+                className.toLowerCase().includes(pattern) ||
+                parentClasses.toLowerCase().includes(pattern))) {
+                continue;
             }
-            // Check for rank numbers (1-14)
+
+            // Check for file letters (a-z) - should be ABOVE or BELOW board
+            if (/^[a-z]$/.test(text)) {
+                const nearTopOrBottom = (
+                    Math.abs(rect.top - boardRect.bottom) < margin ||
+                    Math.abs(rect.bottom - boardRect.top) < margin
+                );
+                if (nearTopOrBottom) {
+                    fileLetters.add(text);
+                }
+            }
+            // Check for rank numbers (1-14) - should be LEFT or RIGHT of board
             else if (/^[0-9]+$/.test(text)) {
+                const nearLeftOrRight = (
+                    Math.abs(rect.left - boardRect.right) < margin ||
+                    Math.abs(rect.right - boardRect.left) < margin
+                );
                 const num = parseInt(text);
-                if (num >= 1 && num <= 14) {
+                if (nearLeftOrRight && num >= 1 && num <= 14) {
                     rankNumbers.add(num);
                 }
             }
@@ -125,39 +136,106 @@ class ChessComInterface:
             print(f"[Board] Error detecting size, defaulting to 8x8: {e}")
             return {'files': 8, 'ranks': 8, 'method': 'error'}
 
+    def get_fen(self):
+        """
+        Get the current board position as FEN (Forsyth-Edwards Notation).
+
+        FEN format: position turn castling en-passant halfmove fullmove
+        Example: rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
+                 (starting position, white's turn)
+
+        Returns:
+            str: FEN string, or None if not available
+        """
+        js_script = """
+        // Try multiple sources for the complete FEN
+        let fen = null;
+
+        // Priority 1: window.chessGame.getFEN() - most common
+        if (window.chessGame && typeof window.chessGame.getFEN === 'function') {
+            try {
+                fen = window.chessGame.getFEN();
+            } catch (e) {}
+        }
+
+        // Priority 2: window.game.getFEN() - alternative location
+        if (!fen && window.game && typeof window.game.getFEN === 'function') {
+            try {
+                fen = window.game.getFEN();
+            } catch (e) {}
+        }
+
+        // Priority 3: window.gameSetup.fen - used for puzzles/from-position games
+        if (!fen && window.gameSetup && window.gameSetup.fen) {
+            fen = window.gameSetup.fen;
+        }
+
+        return fen;
+        """
+
+        try:
+            fen = self.driver.execute_script(js_script)
+            return fen if fen else None
+        except Exception as e:
+            print(f"[ChessCom] Error getting FEN: {e}")
+            return None
+
+
     def get_turn(self):
         """
-        Detect whose turn it is to move.
+        Detect whose turn it is using move list parity.
+
+        Strategy: Check the last move in the move list (top-right panel).
+        - Count individual moves in .moves-table-cell.moves-move elements
+        - If last move index is even (0, 2, 4...) → white moved, black's turn
+        - If last move index is odd (1, 3, 5...) → black moved, white's turn
+        - If no moves yet → White's turn (starting position)
+
+        This is simple, reliable, and works for all variants regardless of FEN format.
 
         Returns:
             str: 'white', 'black', or 'unknown'
         """
         js_script = """
-        // Method 1: Look for turn indicator classes
-        const board = document.querySelector('.TheBoard') ||
-                     document.querySelector('[class*="board"]');
+        // Find the move table container
+        const moveTable = document.querySelector('.moves-table');
 
-        if (board) {
-            // Check if board has turn indicator
-            if (board.className.includes('white')) return 'white';
-            if (board.className.includes('black')) return 'black';
+        if (!moveTable) {
+            return 'unknown';  // Can't find move list
         }
 
-        // Method 2: Look for highlighted/active player
-        const playerActive = document.querySelector('[class*="player"][class*="active"]') ||
-                            document.querySelector('[class*="player"][class*="turn"]');
+        // Find all move cells - these are individual moves (e4, b5, Bxb5, d5, etc.)
+        // Use the specific selector that matches the actual DOM structure
+        const moveCells = moveTable.querySelectorAll('.moves-table-cell.moves-move');
 
-        if (playerActive) {
-            if (playerActive.className.includes('white')) return 'white';
-            if (playerActive.className.includes('black')) return 'black';
+        if (!moveCells || moveCells.length === 0) {
+            return 'white';  // No moves yet, white starts
         }
 
-        // Method 3: Check for move input indicators
-        const moveInput = document.querySelector('[class*="move-input"]');
-        if (moveInput && moveInput.className.includes('white')) return 'white';
-        if (moveInput && moveInput.className.includes('black')) return 'black';
+        // Filter out empty cells (placeholders for future moves)
+        const actualMoves = Array.from(moveCells).filter(cell => {
+            const text = cell.textContent.trim();
+            return text.length > 0;
+        });
 
-        return 'unknown';
+        if (actualMoves.length === 0) {
+            return 'white';  // No actual moves yet
+        }
+
+        // Get the last actual move
+        const lastMoveIndex = actualMoves.length - 1;
+
+        // Parity check:
+        // Index 0 = first move (white's e4) → black's turn next
+        // Index 1 = second move (black's b5) → white's turn next
+        // Index 2 = third move (white's Bxb5) → black's turn next
+        // Index 3 = fourth move (black's d5) → white's turn next
+        // etc.
+        if (lastMoveIndex % 2 === 0) {
+            return 'black';  // Even index (0, 2, 4...) = white moved, black's turn
+        } else {
+            return 'white';  // Odd index (1, 3, 5...) = black moved, white's turn
+        }
         """
 
         try:
@@ -349,9 +427,12 @@ class ChessComInterface:
                 'debug': {}
             }
 
-    def get_username_from_page(self):
+    def get_username_from_page(self, verbose=True):
         """
         Extract the user's username from the page (status bar).
+
+        Args:
+            verbose: If True, print detection messages. If False, silent mode.
 
         Returns:
             str: Username or None if not found
@@ -367,13 +448,16 @@ class ChessComInterface:
         try:
             username = self.driver.execute_script(js_script)
             if username:
-                print(f"[Player] Detected username: {username}")
+                if verbose:
+                    print(f"[Player] Detected username: {username}")
                 return username
             else:
-                print("[Player] Warning: Could not find username in status bar")
+                if verbose:
+                    print("[Player] Warning: Could not find username in status bar")
                 return None
         except Exception as e:
-            print(f"[Player] Error detecting username: {e}")
+            if verbose:
+                print(f"[Player] Error detecting username: {e}")
             return None
 
     def get_player_position(self, username):
@@ -529,7 +613,7 @@ class ChessComInterface:
             traceback.print_exc()
             return {'white_ranks': [], 'black_ranks': [], 'confidence': 'low'}
 
-    def get_player_color(self, username=None):
+    def get_player_color(self, username=None, verbose=True):
         """
         Detect which color the user is playing as.
 
@@ -539,21 +623,27 @@ class ChessComInterface:
 
         Args:
             username: Optional username to use. If None, will auto-detect from page.
+            verbose: If True, print detailed detection info. If False, silent mode.
 
         Returns:
             str: 'white', 'black', or 'unknown'
         """
-        print(f"\n{'='*60}")
-        print(f"[Player Color Detection]")
-        print(f"{'='*60}")
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"[Player Color Detection]")
+            print(f"{'='*60}")
 
         # Step 1: Get username
         if not username:
-            username = self.get_username_from_page()
+            username = self.get_username_from_page(verbose=verbose)
 
         if not username:
-            print("[Player] ⚠ Could not determine username")
+            if verbose:
+                print("[Player] ⚠ Could not determine username")
             return 'unknown'
+
+        if verbose:
+            print(f"[Player] Detected username: {username}")
 
         # Step 2: Find username's playerbox and get data-player attribute
         js_script = f"""
@@ -589,9 +679,10 @@ class ChessComInterface:
             position = result.get('position', 'unknown')
             data_player = result.get('dataPlayer')
 
-            print(f"[Player] Username: {username}")
-            print(f"[Player] Position: {position} playerbox")
-            print(f"[Player] data-player attribute: {data_player}")
+            if verbose:
+                print(f"[Player] Username: {username}")
+                print(f"[Player] Position: {position} playerbox")
+                print(f"[Player] data-player attribute: {data_player}")
 
             # Map data-player to color
             # data-player="0" = White
@@ -603,24 +694,421 @@ class ChessComInterface:
             elif data_player == "2":
                 user_color = 'black'
             else:
-                print(f"[Player] ⚠ Unexpected data-player value: {data_player}")
+                if verbose:
+                    print(f"[Player] ⚠ Unexpected data-player value: {data_player}")
 
-            print(f"\n{'─'*60}")
-            if user_color == 'white':
-                print(f"♙  [Player Color] You are playing: WHITE")
-            elif user_color == 'black':
-                print(f"♟️  [Player Color] You are playing: BLACK")
-            else:
-                print(f"❓ [Player Color] Could not determine (unknown)")
-            print(f"{'='*60}\n")
+            if verbose:
+                print(f"\n{'─'*60}")
+                if user_color == 'white':
+                    print(f"♙  [Player Color] You are playing: WHITE")
+                elif user_color == 'black':
+                    print(f"♟️  [Player Color] You are playing: BLACK")
+                else:
+                    print(f"❓ [Player Color] Could not determine (unknown)")
+                print(f"{'='*60}\n")
 
             return user_color
 
         except Exception as e:
-            print(f"[Player] ✗ Error detecting color: {e}")
+            if verbose:
+                print(f"[Player] ✗ Error detecting color: {e}")
+                import traceback
+                traceback.print_exc()
+            return 'unknown'
+
+    def debug_playerbox_structure(self):
+        """
+        Debug function to inspect the actual playerbox DOM structure.
+        Useful for troubleshooting color detection issues.
+        """
+        print("\n" + "="*60)
+        print("[DEBUG] Playerbox Structure Analysis")
+        print("="*60)
+
+        js_script = """
+        const result = {
+            topBox: null,
+            bottomBox: null,
+            allPlayerElements: []
+        };
+
+        // Find top and bottom playerboxes
+        const topBox = document.querySelector('.playerbox-top');
+        const bottomBox = document.querySelector('.playerbox-bottom');
+
+        if (topBox) {
+            result.topBox = {
+                found: true,
+                innerHTML: topBox.innerHTML.substring(0, 500),
+                classes: topBox.className,
+                dataPlayer: topBox.getAttribute('data-player'),
+                userTag: null,
+                allDataPlayers: []
+            };
+
+            // Find user tag
+            const userTag = topBox.querySelector('.playerbox-user-tag');
+            if (userTag) {
+                result.topBox.userTag = {
+                    text: userTag.textContent,
+                    classes: userTag.className
+                };
+            }
+
+            // Find all elements with data-player attribute
+            const dataPlayerElements = topBox.querySelectorAll('[data-player]');
+            dataPlayerElements.forEach(el => {
+                result.topBox.allDataPlayers.push({
+                    tagName: el.tagName,
+                    dataPlayer: el.getAttribute('data-player'),
+                    classes: el.className,
+                    text: el.textContent.substring(0, 50)
+                });
+            });
+        } else {
+            result.topBox = { found: false };
+        }
+
+        if (bottomBox) {
+            result.bottomBox = {
+                found: true,
+                innerHTML: bottomBox.innerHTML.substring(0, 500),
+                classes: bottomBox.className,
+                dataPlayer: bottomBox.getAttribute('data-player'),
+                userTag: null,
+                allDataPlayers: []
+            };
+
+            // Find user tag
+            const userTag = bottomBox.querySelector('.playerbox-user-tag');
+            if (userTag) {
+                result.bottomBox.userTag = {
+                    text: userTag.textContent,
+                    classes: userTag.className
+                };
+            }
+
+            // Find all elements with data-player attribute
+            const dataPlayerElements = bottomBox.querySelectorAll('[data-player]');
+            dataPlayerElements.forEach(el => {
+                result.bottomBox.allDataPlayers.push({
+                    tagName: el.tagName,
+                    dataPlayer: el.getAttribute('data-player'),
+                    classes: el.className,
+                    text: el.textContent.substring(0, 50)
+                });
+            });
+        } else {
+            result.bottomBox = { found: false };
+        }
+
+        // Find ALL elements with data-player anywhere on the page
+        const allPlayerElements = document.querySelectorAll('[data-player]');
+        allPlayerElements.forEach(el => {
+            result.allPlayerElements.push({
+                tagName: el.tagName,
+                dataPlayer: el.getAttribute('data-player'),
+                classes: el.className,
+                text: el.textContent.substring(0, 50),
+                parent: el.parentElement ? el.parentElement.className : null
+            });
+        });
+
+        return result;
+        """
+
+        try:
+            result = self.driver.execute_script(js_script)
+
+            print("\n[TOP PLAYERBOX]")
+            if result['topBox']['found']:
+                print(f"  ✓ Found")
+                print(f"  Classes: {result['topBox']['classes']}")
+                print(f"  data-player on box: {result['topBox']['dataPlayer']}")
+                if result['topBox']['userTag']:
+                    print(f"  User tag text: {result['topBox']['userTag']['text']}")
+                print(f"  Elements with data-player: {len(result['topBox']['allDataPlayers'])}")
+                for el in result['topBox']['allDataPlayers']:
+                    print(f"    - {el['tagName']}: data-player={el['dataPlayer']}, text={el['text'][:30]}")
+            else:
+                print("  ✗ Not found")
+
+            print("\n[BOTTOM PLAYERBOX]")
+            if result['bottomBox']['found']:
+                print(f"  ✓ Found")
+                print(f"  Classes: {result['bottomBox']['classes']}")
+                print(f"  data-player on box: {result['bottomBox']['dataPlayer']}")
+                if result['bottomBox']['userTag']:
+                    print(f"  User tag text: {result['bottomBox']['userTag']['text']}")
+                print(f"  Elements with data-player: {len(result['bottomBox']['allDataPlayers'])}")
+                for el in result['bottomBox']['allDataPlayers']:
+                    print(f"    - {el['tagName']}: data-player={el['dataPlayer']}, text={el['text'][:30]}")
+            else:
+                print("  ✗ Not found")
+
+            print(f"\n[ALL data-player ELEMENTS ON PAGE]")
+            print(f"  Total found: {len(result['allPlayerElements'])}")
+            for el in result['allPlayerElements']:
+                print(f"    - {el['tagName']}: data-player={el['dataPlayer']}")
+                print(f"      classes: {el['classes']}")
+                print(f"      text: {el['text'][:40]}")
+                print(f"      parent: {el['parent']}")
+                print()
+
+            print("="*60 + "\n")
+
+        except Exception as e:
+            print(f"[DEBUG] ✗ Error: {e}")
             import traceback
             traceback.print_exc()
-            return 'unknown'
+
+    def debug_turn_detection(self):
+        """
+        Debug function to inspect turn detection via move list parity.
+        Useful for troubleshooting turn detection issues.
+        """
+        print("\n" + "="*60)
+        print("[DEBUG] Turn Detection Analysis - Move List Parity")
+        print("="*60)
+
+        detected_turn = self.get_turn()
+
+        js_script = """
+        const result = {
+            moveTable: null,
+            allMoveCells: [],
+            actualMoves: [],
+            lastMove: null
+        };
+
+        // Find the move table
+        const moveTable = document.querySelector('.moves-table');
+
+        if (!moveTable) {
+            result.moveTable = { found: false };
+            return result;
+        }
+
+        result.moveTable = {
+            found: true,
+            classes: moveTable.className
+        };
+
+        // Find all move cells
+        const moveCells = moveTable.querySelectorAll('.moves-table-cell.moves-move');
+
+        result.allMoveCells = Array.from(moveCells).map((cell, index) => ({
+            index: index,
+            text: cell.textContent.trim(),
+            isEmpty: cell.textContent.trim().length === 0,
+            classes: cell.className
+        }));
+
+        // Filter actual moves (non-empty)
+        const actualMoves = Array.from(moveCells).filter(cell =>
+            cell.textContent.trim().length > 0
+        );
+
+        result.actualMoves = Array.from(actualMoves).map((cell, index) => ({
+            index: index,
+            text: cell.textContent.trim(),
+            classes: cell.className,
+            isWhiteMove: index % 2 === 0,
+            nextTurn: index % 2 === 0 ? 'black' : 'white'
+        }));
+
+        if (actualMoves.length > 0) {
+            const lastMoveIndex = actualMoves.length - 1;
+            const lastMove = actualMoves[lastMoveIndex];
+
+            result.lastMove = {
+                index: lastMoveIndex,
+                text: lastMove.textContent.trim(),
+                classes: lastMove.className,
+                isWhiteMove: lastMoveIndex % 2 === 0,
+                nextTurn: lastMoveIndex % 2 === 0 ? 'black' : 'white'
+            };
+        }
+
+        return result;
+        """
+
+        try:
+            result = self.driver.execute_script(js_script)
+
+            print("\n[MOVE TABLE]")
+            if result['moveTable'] and result['moveTable']['found']:
+                print(f"  ✓ Found .moves-table")
+                print(f"  Classes: {result['moveTable']['classes']}")
+            else:
+                print("  ✗ .moves-table not found")
+                print("  ⚠ Make sure game window is large enough for move list to be visible")
+                print("="*60 + "\n")
+                return
+
+            print(f"\n[ALL MOVE CELLS]")
+            print(f"  Total cells found: {len(result['allMoveCells'])}")
+            if len(result['allMoveCells']) > 0:
+                for cell in result['allMoveCells'][:10]:
+                    empty_marker = " (EMPTY)" if cell['isEmpty'] else ""
+                    print(f"    [{cell['index']}] '{cell['text']}'{empty_marker}")
+                if len(result['allMoveCells']) > 10:
+                    print(f"    ... and {len(result['allMoveCells']) - 10} more")
+
+            print(f"\n[ACTUAL MOVES] (non-empty cells)")
+            print(f"  Total actual moves: {len(result['actualMoves'])}")
+            if len(result['actualMoves']) > 0:
+                show_count = min(8, len(result['actualMoves']))
+                for move in result['actualMoves'][:show_count]:
+                    color = "WHITE" if move['isWhiteMove'] else "BLACK"
+                    print(f"    [{move['index']}] {move['text']:8s} ({color}) → Next: {move['nextTurn']}")
+
+                if len(result['actualMoves']) > show_count:
+                    remaining = len(result['actualMoves']) - show_count
+                    print(f"    ... and {remaining} more moves")
+
+            print("\n[LAST MOVE ANALYSIS]")
+            if result['lastMove']:
+                lm = result['lastMove']
+                color = "WHITE" if lm['isWhiteMove'] else "BLACK"
+                print(f"  Last move: '{lm['text']}' (index {lm['index']})")
+                print(f"  Color: {color}")
+                print(f"  Logic: {color} just moved → {lm['nextTurn'].upper()}'s turn")
+            else:
+                print("  No moves yet → White's turn (starting position)")
+
+            print(f"\n[FINAL RESULT]")
+            print(f"  ✓ Detected turn: {detected_turn}")
+
+            print("="*60 + "\n")
+
+        except Exception as e:
+            print(f"[DEBUG] ✗ Error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _old_debug_turn_detection_dom(self):
+        """
+        OLD debug function - kept for reference.
+        Inspects DOM elements for turn indicators (CSS classes, etc).
+        """
+        js_script = """
+        const result = {
+            board: null,
+            playerBoxes: [],
+            clocks: [],
+            anyActiveElements: []
+        };
+
+        // Check board element and its classes
+        const board = document.querySelector('.TheBoard') ||
+                     document.querySelector('[class*="board"]');
+        if (board) {
+            result.board = {
+                found: true,
+                classes: board.className,
+                hasWhite: board.className.includes('white'),
+                hasBlack: board.className.includes('black')
+            };
+        }
+
+        // Check player boxes for active/turn indicators
+        const topBox = document.querySelector('.playerbox-top');
+        const bottomBox = document.querySelector('.playerbox-bottom');
+
+        if (topBox) {
+            result.playerBoxes.push({
+                position: 'top',
+                classes: topBox.className,
+                hasActive: topBox.className.includes('active'),
+                hasTurn: topBox.className.includes('turn'),
+                dataPlayer: topBox.querySelector('[data-player]')?.getAttribute('data-player')
+            });
+        }
+
+        if (bottomBox) {
+            result.playerBoxes.push({
+                position: 'bottom',
+                classes: bottomBox.className,
+                hasActive: bottomBox.className.includes('active'),
+                hasTurn: bottomBox.className.includes('turn'),
+                dataPlayer: bottomBox.querySelector('[data-player]')?.getAttribute('data-player')
+            });
+        }
+
+        // Check clock elements
+        const clocks = document.querySelectorAll('[class*="clock"]');
+        clocks.forEach(clock => {
+            const rect = clock.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+                result.clocks.push({
+                    classes: clock.className,
+                    text: clock.textContent.trim(),
+                    hasRunning: clock.className.includes('running'),
+                    hasActive: clock.className.includes('active'),
+                    parent: clock.parentElement?.className || 'none'
+                });
+            }
+        });
+
+        // Find any elements with 'active' or 'turn' in their class
+        const activeElements = document.querySelectorAll('[class*="active"], [class*="turn"]');
+        activeElements.forEach(el => {
+            if (el.className.includes('player') ||
+                el.className.includes('board') ||
+                el.className.includes('clock')) {
+                result.anyActiveElements.push({
+                    tagName: el.tagName,
+                    classes: el.className,
+                    text: el.textContent.substring(0, 30)
+                });
+            }
+        });
+
+        return result;
+        """
+
+        try:
+            result = self.driver.execute_script(js_script)
+
+            print("\n[BOARD ELEMENT]")
+            if result['board']:
+                print(f"  ✓ Found")
+                print(f"  Classes: {result['board']['classes']}")
+                print(f"  Has 'white': {result['board']['hasWhite']}")
+                print(f"  Has 'black': {result['board']['hasBlack']}")
+            else:
+                print("  ✗ Not found")
+
+            print("\n[PLAYER BOXES]")
+            for box in result['playerBoxes']:
+                print(f"  {box['position'].upper()} box:")
+                print(f"    Classes: {box['classes']}")
+                print(f"    Has 'active': {box['hasActive']}")
+                print(f"    Has 'turn': {box['hasTurn']}")
+                print(f"    data-player: {box['dataPlayer']}")
+
+            print("\n[CLOCKS]")
+            print(f"  Total found: {len(result['clocks'])}")
+            for i, clock in enumerate(result['clocks']):
+                print(f"  Clock {i+1}:")
+                print(f"    Classes: {clock['classes']}")
+                print(f"    Time: {clock['text']}")
+                print(f"    Has 'running': {clock['hasRunning']}")
+                print(f"    Has 'active': {clock['hasActive']}")
+                print(f"    Parent: {clock['parent']}")
+
+            print("\n[ELEMENTS WITH 'active' OR 'turn']")
+            print(f"  Total found: {len(result['anyActiveElements'])}")
+            for el in result['anyActiveElements']:
+                print(f"    - {el['tagName']}: {el['classes'][:80]}")
+
+            print("="*60 + "\n")
+
+        except Exception as e:
+            print(f"[DEBUG] ✗ Error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def is_board_flipped(self):
         """
@@ -755,12 +1243,13 @@ class ChessComInterface:
 
             print(f"[ChessCom] Move: {from_square} → {to_square}")
 
-            # Detect board orientation once (cache for this move)
+            # Detect board orientation and size once (cache for this move)
             is_flipped = self.is_board_flipped()
+            board_size = self.detect_board_size()
 
-            # Get coordinates for both squares (pass cached flip state)
-            from_coords = self.get_square_coordinates(from_square, is_flipped)
-            to_coords = self.get_square_coordinates(to_square, is_flipped)
+            # Get coordinates for both squares (pass cached flip state and board size)
+            from_coords = self.get_square_coordinates(from_square, is_flipped, board_size)
+            to_coords = self.get_square_coordinates(to_square, is_flipped, board_size)
 
             if not from_coords or not to_coords:
                 print(f"[ChessCom] ✗ Could not find board squares")
@@ -848,9 +1337,13 @@ class ChessComInterface:
 
             print(f"[ChessCom] Move: {from_square} -> {to_square}")
 
+            # Detect board parameters once (cache for this move)
+            is_flipped = self.is_board_flipped()
+            board_size = self.detect_board_size()
+
             # Get coordinates for both squares
-            from_coords = self.get_square_coordinates(from_square)
-            to_coords = self.get_square_coordinates(to_square)
+            from_coords = self.get_square_coordinates(from_square, is_flipped, board_size)
+            to_coords = self.get_square_coordinates(to_square, is_flipped, board_size)
 
             if not from_coords or not to_coords:
                 print(f"[ChessCom] Could not find board squares")
@@ -1315,9 +1808,13 @@ class ChessComInterface:
             from_square = parsed['from']
             to_square = parsed['to']
 
+            # Detect board parameters once (cache for this move)
+            is_flipped = self.is_board_flipped()
+            board_size = self.detect_board_size()
+
             # Get coordinates for both squares
-            from_coords = self.get_square_coordinates(from_square)
-            to_coords = self.get_square_coordinates(to_square)
+            from_coords = self.get_square_coordinates(from_square, is_flipped, board_size)
+            to_coords = self.get_square_coordinates(to_square, is_flipped, board_size)
 
             if not from_coords or not to_coords:
                 print(f"[ChessCom] Could not find board squares")
@@ -1597,11 +2094,12 @@ class ChessComInterface:
                 print(f"[ChessCom] ✗ Could not find {piece_type} in pocket")
                 return False
 
-            # Detect board orientation
+            # Detect board parameters once (cache for this move)
             is_flipped = self.is_board_flipped()
+            board_size = self.detect_board_size()
 
             # Get coordinates of destination square
-            to_coords = self.get_square_coordinates(to_square, is_flipped)
+            to_coords = self.get_square_coordinates(to_square, is_flipped, board_size)
             if not to_coords:
                 print(f"[ChessCom] ✗ Could not find destination square {to_square}")
                 return False
@@ -1661,4 +2159,941 @@ class ChessComInterface:
             import traceback
             traceback.print_exc()
             return False
+
+    def resign(self):
+        """
+        Resign the current game by clicking the resign button.
+
+        Returns:
+            bool: True if resign was successful, False otherwise
+        """
+        print("[ChessCom] Attempting to resign...")
+
+        try:
+            js_script = """
+            // Find resign button - try multiple selectors
+            const resignSelectors = [
+                'button[aria-label*="Resign"]',
+                'button:has-text("Resign")',
+                '[class*="resign"]',
+                'button[data-cy="resign"]',
+                '[data-test-element="resign"]'
+            ];
+
+            // Try to find resign button
+            let resignButton = null;
+
+            // Method 1: Look for buttons with "resign" text
+            const allButtons = document.querySelectorAll('button');
+            for (const button of allButtons) {
+                const text = button.textContent?.toLowerCase() || '';
+                const ariaLabel = button.getAttribute('aria-label')?.toLowerCase() || '';
+
+                if (text.includes('resign') || ariaLabel.includes('resign')) {
+                    const rect = button.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        resignButton = button;
+                        break;
+                    }
+                }
+            }
+
+            // Method 2: Look in game menu/options
+            if (!resignButton) {
+                // Try to find and open game menu first
+                const menuButtons = document.querySelectorAll('button[aria-label*="Menu"], button[aria-label*="menu"], [class*="menu-button"]');
+                for (const menuBtn of menuButtons) {
+                    const rect = menuBtn.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        menuBtn.click();
+                        break;
+                    }
+                }
+
+                // Wait a bit for menu to open
+                return { needsMenu: true };
+            }
+
+            if (!resignButton) {
+                return { error: 'Resign button not found' };
+            }
+
+            // Get button coordinates for CDP click
+            const rect = resignButton.getBoundingClientRect();
+            return {
+                found: true,
+                x: rect.left + rect.width / 2,
+                y: rect.top + rect.height / 2
+            };
+            """
+
+            result = self.driver.execute_script(js_script)
+
+            if result.get('needsMenu'):
+                # Menu was opened, wait and try again
+                time.sleep(0.5)
+                result = self.driver.execute_script(js_script)
+
+            if result.get('found'):
+                x = result['x']
+                y = result['y']
+
+                print(f"[ChessCom] Clicking resign button at ({x}, {y})")
+
+                # Click using CDP
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseMoved',
+                    'x': x,
+                    'y': y
+                })
+                time.sleep(0.05)
+
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mousePressed',
+                    'x': x,
+                    'y': y,
+                    'button': 'left',
+                    'clickCount': 1
+                })
+                time.sleep(0.05)
+
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseReleased',
+                    'x': x,
+                    'y': y,
+                    'button': 'left',
+                    'clickCount': 1
+                })
+
+                # Wait for confirmation dialog
+                time.sleep(0.5)
+
+                # Look for confirmation button
+                confirm_script = """
+                const confirmButtons = document.querySelectorAll('button');
+                for (const button of confirmButtons) {
+                    const text = button.textContent?.toLowerCase() || '';
+                    if (text.includes('resign') || text.includes('confirm') || text.includes('yes')) {
+                        const rect = button.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            return {
+                                found: true,
+                                x: rect.left + rect.width / 2,
+                                y: rect.top + rect.height / 2
+                            };
+                        }
+                    }
+                }
+                return { found: false };
+                """
+
+                confirm_result = self.driver.execute_script(confirm_script)
+
+                if confirm_result.get('found'):
+                    # Click confirmation button
+                    x = confirm_result['x']
+                    y = confirm_result['y']
+
+                    print(f"[ChessCom] Confirming resignation at ({x}, {y})")
+
+                    self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                        'type': 'mouseMoved',
+                        'x': x,
+                        'y': y
+                    })
+                    time.sleep(0.05)
+
+                    self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                        'type': 'mousePressed',
+                        'x': x,
+                        'y': y,
+                        'button': 'left',
+                        'clickCount': 1
+                    })
+                    time.sleep(0.05)
+
+                    self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                        'type': 'mouseReleased',
+                        'x': x,
+                        'y': y,
+                        'button': 'left',
+                        'clickCount': 1
+                    })
+
+                print("[ChessCom] ✓ Resignation successful")
+                return True
+            else:
+                print(f"[ChessCom] ✗ {result.get('error', 'Could not find resign button')}")
+                print("[ChessCom] Hint: Make sure you're in an active game")
+                return False
+
+        except Exception as e:
+            print(f"[ChessCom] ✗ Error resigning: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def rematch(self):
+        """
+        Request a rematch after a game ends by clicking the Rematch button.
+
+        Returns:
+            bool: True if rematch was successful, False otherwise
+        """
+        print("[ChessCom] Attempting to click Rematch button...")
+
+        try:
+            js_script = """
+            // Find rematch button - appears after game ends
+            const rematchSelectors = [
+                'button[aria-label*="Rematch"]',
+                'button[aria-label*="rematch"]',
+                '[class*="rematch"]',
+                'button[data-cy="rematch"]'
+            ];
+
+            let rematchButton = null;
+
+            // Look for buttons with "rematch" text (not "play again")
+            const allButtons = document.querySelectorAll('button, a');
+            for (const button of allButtons) {
+                const text = button.textContent?.toLowerCase() || '';
+                const ariaLabel = button.getAttribute('aria-label')?.toLowerCase() || '';
+
+                if (text.includes('rematch') || ariaLabel.includes('rematch')) {
+                    const rect = button.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        rematchButton = button;
+                        break;
+                    }
+                }
+            }
+
+            if (!rematchButton) {
+                return { error: 'Rematch button not found - game may not be over yet' };
+            }
+
+            // Get button coordinates for CDP click
+            const rect = rematchButton.getBoundingClientRect();
+            return {
+                found: true,
+                x: rect.left + rect.width / 2,
+                y: rect.top + rect.height / 2,
+                text: rematchButton.textContent
+            };
+            """
+
+            result = self.driver.execute_script(js_script)
+
+            if result.get('found'):
+                x = result['x']
+                y = result['y']
+
+                print(f"[ChessCom] Clicking Rematch button at ({x}, {y})")
+
+                # Click using CDP
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseMoved',
+                    'x': x,
+                    'y': y
+                })
+                time.sleep(0.05)
+
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mousePressed',
+                    'x': x,
+                    'y': y,
+                    'button': 'left',
+                    'clickCount': 1
+                })
+                time.sleep(0.05)
+
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseReleased',
+                    'x': x,
+                    'y': y,
+                    'button': 'left',
+                    'clickCount': 1
+                })
+
+                time.sleep(0.5)
+                print("[ChessCom] ✓ Rematch button clicked")
+                return True
+            else:
+                print(f"[ChessCom] ✗ {result.get('error', 'Could not find Rematch button')}")
+                print("[ChessCom] Hint: Make sure the game has ended")
+                return False
+
+        except Exception as e:
+            print(f"[ChessCom] ✗ Error clicking Rematch button: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def play_again(self):
+        """
+        Request to play again after a game ends by clicking the Play Again button.
+
+        Returns:
+            bool: True if play again was successful, False otherwise
+        """
+        print("[ChessCom] Attempting to click Play Again button...")
+
+        try:
+            js_script = """
+            // Find play again button - appears after game ends
+            const playAgainSelectors = [
+                'button[aria-label*="Play"]',
+                'button[aria-label*="play"]',
+                '[class*="play-again"]',
+                'button[data-cy="play-again"]'
+            ];
+
+            let playAgainButton = null;
+
+            // Look for buttons with "play again" or "play" text (not "rematch")
+            // Note: Button may be shortened to just "Play"
+            // Important: Ignore buttons in the left sidebar
+            const allButtons = document.querySelectorAll('button, a');
+            for (const button of allButtons) {
+                const text = button.textContent?.toLowerCase() || '';
+                const ariaLabel = button.getAttribute('aria-label')?.toLowerCase() || '';
+
+                // Check for "play again" or standalone "play" (but not "rematch")
+                const hasPlayAgain = text.includes('play again') || ariaLabel.includes('play again');
+                const hasPlay = (text.trim() === 'play' || text.includes('play')) && !text.includes('rematch');
+
+                if (hasPlayAgain || hasPlay) {
+                    const rect = button.getBoundingClientRect();
+
+                    // Ignore buttons in the left sidebar (typically x < 250px)
+                    // We want the Play button in the main game area
+                    if (rect.width > 0 && rect.height > 0 && rect.left > 250) {
+                        playAgainButton = button;
+                        break;
+                    }
+                }
+            }
+
+            if (!playAgainButton) {
+                return { error: 'Play Again button not found - game may not be over yet' };
+            }
+
+            // Get button coordinates for CDP click
+            const rect = playAgainButton.getBoundingClientRect();
+            return {
+                found: true,
+                x: rect.left + rect.width / 2,
+                y: rect.top + rect.height / 2,
+                text: playAgainButton.textContent
+            };
+            """
+
+            result = self.driver.execute_script(js_script)
+
+            if result.get('found'):
+                x = result['x']
+                y = result['y']
+
+                print(f"[ChessCom] Clicking Play Again button at ({x}, {y})")
+
+                # Click using CDP
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseMoved',
+                    'x': x,
+                    'y': y
+                })
+                time.sleep(0.05)
+
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mousePressed',
+                    'x': x,
+                    'y': y,
+                    'button': 'left',
+                    'clickCount': 1
+                })
+                time.sleep(0.05)
+
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseReleased',
+                    'x': x,
+                    'y': y,
+                    'button': 'left',
+                    'clickCount': 1
+                })
+
+                time.sleep(0.5)
+                print("[ChessCom] ✓ Play Again button clicked")
+                return True
+            else:
+                print(f"[ChessCom] ✗ {result.get('error', 'Could not find Play Again button')}")
+                print("[ChessCom] Hint: Make sure the game has ended")
+                return False
+
+        except Exception as e:
+            print(f"[ChessCom] ✗ Error clicking Play Again button: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def exit_to_lobby(self):
+        """
+        Exit to the lobby after a game by clicking the Exit button.
+
+        Returns:
+            bool: True if exit was successful, False otherwise
+        """
+        print("[ChessCom] Attempting to click Exit button...")
+
+        try:
+            js_script = """
+            // Find exit button - appears after game ends
+            const exitSelectors = [
+                'button[aria-label*="Exit"]',
+                'button[aria-label*="exit"]',
+                '[class*="exit"]',
+                'button[data-cy="exit"]'
+            ];
+
+            let exitButton = null;
+
+            // Look for buttons with "exit" text
+            const allButtons = document.querySelectorAll('button, a');
+            for (const button of allButtons) {
+                const text = button.textContent?.toLowerCase() || '';
+                const ariaLabel = button.getAttribute('aria-label')?.toLowerCase() || '';
+
+                if (text.includes('exit') || ariaLabel.includes('exit')) {
+                    const rect = button.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        exitButton = button;
+                        break;
+                    }
+                }
+            }
+
+            if (!exitButton) {
+                return { error: 'Exit button not found - game may not be over yet' };
+            }
+
+            // Get button coordinates for CDP click
+            const rect = exitButton.getBoundingClientRect();
+            return {
+                found: true,
+                x: rect.left + rect.width / 2,
+                y: rect.top + rect.height / 2,
+                text: exitButton.textContent
+            };
+            """
+
+            result = self.driver.execute_script(js_script)
+
+            if result.get('found'):
+                x = result['x']
+                y = result['y']
+
+                print(f"[ChessCom] Clicking Exit button at ({x}, {y})")
+
+                # Click using CDP
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseMoved',
+                    'x': x,
+                    'y': y
+                })
+                time.sleep(0.05)
+
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mousePressed',
+                    'x': x,
+                    'y': y,
+                    'button': 'left',
+                    'clickCount': 1
+                })
+                time.sleep(0.05)
+
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseReleased',
+                    'x': x,
+                    'y': y,
+                    'button': 'left',
+                    'clickCount': 1
+                })
+
+                time.sleep(0.5)
+                print("[ChessCom] ✓ Exit button clicked, returning to lobby")
+                return True
+            else:
+                print(f"[ChessCom] ✗ {result.get('error', 'Could not find Exit button')}")
+                print("[ChessCom] Hint: Make sure the game has ended or you're on the post-game screen")
+                return False
+
+        except Exception as e:
+            print(f"[ChessCom] ✗ Error clicking Exit button: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def detect_game_started(self):
+        """
+        Detect if a new game has started by checking for:
+        - Chat message with "Game #X started"
+        - Blue notification pop-ups
+        - Username in player boxes
+
+        Returns:
+            dict: {
+                'started': bool,
+                'game_number': str or None,
+                'method': str (how it was detected)
+            }
+        """
+        try:
+            js_script = """
+            const result = {
+                started: false,
+                game_number: null,
+                method: null
+            };
+
+            // Method 1: Check for "Game #X started" in chat
+            const chatMessages = document.querySelectorAll('[class*="chat"], [class*="message"]');
+            for (const msg of chatMessages) {
+                const text = msg.textContent || '';
+                const match = text.match(/Game #(\\d+) started/i);
+                if (match) {
+                    result.started = true;
+                    result.game_number = match[1];
+                    result.method = 'chat_message';
+                    return result;
+                }
+            }
+
+            // Method 2: Check for blue notification pop-ups (game starting notifications)
+            const notifications = document.querySelectorAll('[class*="notification"], [class*="alert"], [class*="toast"]');
+            for (const notif of notifications) {
+                const text = (notif.textContent || '').toLowerCase();
+                if (text.includes('game has begun') ||
+                    text.includes('game is starting') ||
+                    text.includes('your game')) {
+                    const rect = notif.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        result.started = true;
+                        result.method = 'notification_popup';
+                        return result;
+                    }
+                }
+            }
+
+            // Method 3: Check if username is in player boxes and game is active
+            const playerBoxes = document.querySelectorAll('[class*="player"], [class*="user"]');
+            let usernameFound = false;
+
+            for (const box of playerBoxes) {
+                const text = (box.textContent || '').trim();
+                if (text.length > 0 && text.length < 50) {
+                    // Check if this looks like an active game (timer present, etc.)
+                    const parent = box.closest('[class*="player-component"], [class*="player-panel"]');
+                    if (parent) {
+                        const hasTimer = parent.querySelector('[class*="clock"], [class*="timer"]');
+                        if (hasTimer) {
+                            usernameFound = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (usernameFound) {
+                result.started = true;
+                result.method = 'player_boxes';
+            }
+
+            return result;
+            """
+
+            result = self.driver.execute_script(js_script)
+            return result
+
+        except Exception as e:
+            print(f"[ChessCom] Error detecting game start: {e}")
+            return {'started': False, 'game_number': None, 'method': None}
+
+    def setup_move_observer(self):
+        """
+        Set up a MutationObserver to watch for board/move changes.
+        This detects when the opponent makes a move (truly event-driven).
+
+        The observer sets a JS global flag, which Python polls via execute_script.
+        (console.log-based approach doesn't work when attaching to existing browser)
+        """
+        js_script = """
+        // Clean up any existing observer
+        if (window.__moveObserver) {
+            window.__moveObserver.disconnect();
+            delete window.__moveObserver;
+        }
+
+        // Initialize the flag
+        window.__boardChanged = false;
+
+        // Debounce timer to batch rapid changes
+        let debounceTimer = null;
+
+        // Create the observer
+        const observer = new MutationObserver(() => {
+            // Debounce: wait 50ms for all related mutations to complete
+            // Prevents duplicate triggers while maintaining responsiveness
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+                // Set global flag - Python polls this via execute_script
+                window.__boardChanged = true;
+            }, 50);
+        });
+
+        // Watch only the moves table - this fires exactly once per move played.
+        // NOTE: Variants server uses .moves-table, NOT .move-list
+        // Observing the board element (even childList only) fires on every piece
+        // animation (elements added/removed during movement), so we avoid it.
+        const moveTable = document.querySelector('.moves-table');
+        const movesContainer = document.querySelector('[class*="moves"]');
+
+        let observerActive = false;
+
+        if (moveTable) {
+            observer.observe(moveTable, {
+                childList: true,
+                subtree: true
+            });
+            observerActive = true;
+        }
+
+        if (movesContainer && movesContainer !== moveTable) {
+            observer.observe(movesContainer, {
+                childList: true,
+                subtree: true
+            });
+            observerActive = true;
+        }
+
+        if (observerActive) {
+            window.__moveObserver = observer;
+            return true;
+        } else {
+            return false;
+        }
+        """
+
+        try:
+            result = self.driver.execute_script(js_script)
+            return result
+        except Exception as e:
+            print(f"[ChessCom] Error setting up move observer: {e}")
+            return False
+
+    def reset_game_over_observer(self):
+        """Reset the game over observer flags so the next game is detected."""
+        try:
+            self.driver.execute_script(
+                "window.__gameOver = false; window.__gameOverLogged = false;"
+            )
+        except:
+            pass
+
+    def setup_game_over_observer(self):
+        """
+        Set up a MutationObserver to watch for game over dialog appearing.
+        This is truly event-driven using console log notifications.
+
+        The observer logs to console when a dialog appears.
+        Python listens to browser console logs (no polling of DOM!).
+        """
+        js_script = """
+        // Clean up any existing observer
+        if (window.__gameOverObserver) {
+            window.__gameOverObserver.disconnect();
+            delete window.__gameOverObserver;
+        }
+
+        // Initialize flags (both exposed on window so Python can reset them)
+        window.__gameOver = false;
+        window.__gameOverLogged = false;
+
+        // Create the observer
+        const observer = new MutationObserver((mutations) => {
+            // Only check if we haven't already logged
+            if (window.__gameOverLogged) return;
+
+            // Check if any game over dialog has appeared.
+            // Use a broad set of class selectors since variants.chess.com may
+            // use class names unlike the standard chess.com modal/dialog names.
+            const GAME_OVER_RE = /black won|white won|you won|you lost|you drew|draw|checkmate|stalemate|time.*out|resign/i;
+
+            const selectors =
+                '[class*="modal"], [class*="dialog"], [class*="popup"], ' +
+                '[class*="game-over"], [class*="result"], [class*="challenge"], ' +
+                '[class*="win"], [class*="victory"], [class*="defeat"], [class*="end"]';
+
+            for (const dialog of document.querySelectorAll(selectors)) {
+                const rect = dialog.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    if (GAME_OVER_RE.test(dialog.textContent || '')) {
+                        window.__gameOver = true;
+                        window.__gameOverLogged = true;
+                        return;
+                    }
+                }
+            }
+
+            // Fallback: scan visible, large-enough divs whose inline style
+            // indicates overlay/modal positioning (position:fixed or z-index).
+            for (const el of document.querySelectorAll(
+                    '[style*="position: fixed"], [style*="position:fixed"], [style*="z-index"]')) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width > 150 && rect.height > 80) {
+                    if (GAME_OVER_RE.test(el.textContent || '')) {
+                        window.__gameOver = true;
+                        window.__gameOverLogged = true;
+                        return;
+                    }
+                }
+            }
+        });
+
+        // Watch the entire document body for changes
+        // This catches any new dialogs being added
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['class', 'style']  // Watch for dialogs becoming visible
+        });
+
+        window.__gameOverObserver = observer;
+        return true;
+        """
+
+        try:
+            self.driver.execute_script(js_script)
+            return True
+        except Exception as e:
+            print(f"[ChessCom] Error setting up game over observer: {e}")
+            return False
+
+    def detect_game_over(self):
+        """
+        Detect if the game has ended by looking for the result dialog.
+
+        Returns:
+            dict: {
+                'game_over': bool,
+                'result': str or None (e.g., "Black Won", "White Won", "Draw"),
+                'dialog_found': bool
+            }
+        """
+        try:
+            js_script = """
+            const result = {
+                game_over: false,
+                result: null,
+                dialog_found: false,
+                dialog_coords: null
+            };
+
+            const GAME_OVER_RE = /black won|white won|you won|you lost|you drew|draw|checkmate|stalemate|time.*out|resign/i;
+
+            function extractResult(text) {
+                if (text.match(/black won/i))  return 'Black Won';
+                if (text.match(/white won/i))  return 'White Won';
+                if (text.match(/you won/i))    return 'You Won';
+                if (text.match(/you lost/i))   return 'You Lost';
+                if (text.match(/you drew/i))   return 'Draw';
+                if (text.match(/stalemate/i))  return 'Stalemate';
+                if (text.match(/draw/i))       return 'Draw';
+                if (text.match(/resign/i))     return 'Resigned';
+                return 'Game Over';
+            }
+
+            function checkElement(el) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) return false;
+                const text = el.textContent || '';
+                if (!GAME_OVER_RE.test(text)) return false;
+                result.game_over = true;
+                result.dialog_found = true;
+                result.result = extractResult(text);
+                result.dialog_coords = {
+                    left: rect.left, top: rect.top,
+                    right: rect.right, bottom: rect.bottom,
+                    width: rect.width, height: rect.height
+                };
+                return true;
+            }
+
+            // Primary sweep: broad set of class-name patterns
+            const selectors =
+                '[class*="modal"], [class*="dialog"], [class*="popup"], ' +
+                '[class*="game-over"], [class*="result"], [class*="challenge"], ' +
+                '[class*="win"], [class*="victory"], [class*="defeat"], [class*="end"]';
+            for (const el of document.querySelectorAll(selectors)) {
+                if (checkElement(el)) return result;
+            }
+
+            // Fallback: inline-styled overlay/modal elements
+            for (const el of document.querySelectorAll(
+                    '[style*="position: fixed"], [style*="position:fixed"], [style*="z-index"]')) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width > 150 && rect.height > 80 && checkElement(el)) return result;
+            }
+
+            return result;
+            """
+
+            result = self.driver.execute_script(js_script)
+            return result
+
+        except Exception as e:
+            print(f"[ChessCom] Error detecting game over: {e}")
+            return {'game_over': False, 'result': None, 'dialog_found': False}
+
+    def dismiss_game_over_dialog(self):
+        """
+        Dismiss the game over dialog by clicking outside it or on the X button.
+
+        Returns:
+            bool: True if dismissal was successful, False otherwise
+        """
+        print("[ChessCom] Attempting to dismiss game over dialog...")
+
+        try:
+            js_script = """
+            // Find the X button in the dialog
+            const closeButtons = document.querySelectorAll(
+                '[class*="close"], [class*="dismiss"], [aria-label*="close"], ' +
+                '[aria-label*="Close"], button[class*="icon-"]'
+            );
+
+            for (const btn of closeButtons) {
+                const rect = btn.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    // Check if this button is in the top-right area of a dialog
+                    const parent = btn.closest('[class*="modal"], [class*="dialog"]');
+                    if (parent) {
+                        const parentRect = parent.getBoundingClientRect();
+                        // X button should be in upper right
+                        if (rect.right > parentRect.right - 50 && rect.top < parentRect.top + 50) {
+                            return {
+                                found: true,
+                                method: 'close_button',
+                                x: rect.left + rect.width / 2,
+                                y: rect.top + rect.height / 2
+                            };
+                        }
+                    }
+                }
+            }
+
+            // If no X button found, click outside the dialog (backdrop)
+            const dialogs = document.querySelectorAll('[class*="modal"], [class*="dialog"]');
+            for (const dialog of dialogs) {
+                const rect = dialog.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    // Click to the left of the dialog (on the backdrop)
+                    return {
+                        found: true,
+                        method: 'backdrop',
+                        x: Math.max(50, rect.left - 50),
+                        y: rect.top + rect.height / 2
+                    };
+                }
+            }
+
+            return { found: false };
+            """
+
+            result = self.driver.execute_script(js_script)
+
+            if result.get('found'):
+                x = result['x']
+                y = result['y']
+                method = result['method']
+
+                print(f"[ChessCom] Clicking to dismiss dialog ({method}) at ({x}, {y})")
+
+                # Click using CDP
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseMoved',
+                    'x': x,
+                    'y': y
+                })
+                time.sleep(0.05)
+
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mousePressed',
+                    'x': x,
+                    'y': y,
+                    'button': 'left',
+                    'clickCount': 1
+                })
+                time.sleep(0.05)
+
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseReleased',
+                    'x': x,
+                    'y': y,
+                    'button': 'left',
+                    'clickCount': 1
+                })
+
+                time.sleep(0.3)
+                print("[ChessCom] ✓ Dialog dismissed")
+                return True
+            else:
+                print("[ChessCom] ✗ Could not find dialog to dismiss")
+                return False
+
+        except Exception as e:
+            print(f"[ChessCom] ✗ Error dismissing dialog: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def get_game_state(self):
+        """
+        Get the current game state (whether in an active game or not).
+
+        Returns:
+            dict: {
+                'in_game': bool,
+                'username': str or None,
+                'color': str or None,
+                'turn': str or None
+            }
+        """
+        try:
+            # Check if we can get player color (indicates active game)
+            # Use verbose=False to avoid spamming console during automatic monitoring
+            color = self.get_player_color(verbose=False)
+            turn = self.get_turn()
+            username = self.get_username_from_page(verbose=False)
+
+            # We're in a game if data-player is 0 or 2, which means color is 'white' or 'black'
+            # If color is 'unknown', it means data-player was None, so we're NOT in a game
+            # We only need to check color since data-player is the reliable indicator
+            in_game = (color in ['white', 'black'])
+
+            return {
+                'in_game': in_game,
+                'username': username,
+                'color': color,
+                'turn': turn
+            }
+
+        except Exception as e:
+            print(f"[ChessCom] Error getting game state: {e}")
+            return {
+                'in_game': False,
+                'username': None,
+                'color': None,
+                'turn': None
+            }
 
