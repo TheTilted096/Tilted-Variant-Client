@@ -296,6 +296,7 @@ class VariantsClient:
         print("  - 'rematch' - Click the Rematch button after game ends")
         print("  - 'play-again' - Click the Play Again button after game ends")
         print("  - 'lobby' - Click the Exit button to return to lobby")
+        print("  - 'cancel' - Cancel pending challenge(s) (clicks 'Cancel' or 'Cancel All')")
         print("  - 'status' - Check current game state (in game or not)")
         print("  - 'monitor' - Toggle automatic game state monitoring")
         print("  - 'debug' - Inspect board structure")
@@ -360,6 +361,30 @@ class VariantsClient:
                         print("[Success] Exit button clicked, returning to lobby!")
                     else:
                         print("[Error] Failed to click Exit button")
+                    print()
+                    continue
+                elif command == 'cancel':
+                    print("[Client] Cancelling pending challenge(s)...")
+                    success = self.chesscom_interface.cancel_challenge()
+                    if success:
+                        print("[Success] Challenge(s) cancelled!")
+                    else:
+                        print("[Error] Failed to cancel — no pending challenges?")
+                    print()
+                    continue
+                elif command.startswith('challenge'):
+                    parts = user_input.split(None, 1)
+                    if len(parts) < 2:
+                        print("[Error] Usage: challenge <variant>  (e.g. challenge Chaturanga)")
+                        print()
+                        continue
+                    variant = parts[1].strip()
+                    print(f"[Client] Creating challenge for variant: {variant}")
+                    success = self.chesscom_interface.create_challenge(variant)
+                    if success:
+                        print(f"[Success] Challenge flow initiated for {variant}!")
+                    else:
+                        print(f"[Error] Failed to create challenge for {variant}")
                     print()
                     continue
                 elif command == 'status':

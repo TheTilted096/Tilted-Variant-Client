@@ -2633,6 +2633,467 @@ class ChessComInterface:
             traceback.print_exc()
             return False
 
+    # Maps CLI shorthand → text to type into the variant search box.
+    _VARIANT_SEARCH = {
+        'koth': 'King of the Hill',
+    }
+
+    def create_challenge(self, variant_name):
+        """
+        Begin the challenge-creation flow for the given variant.
+
+        Steps (per spec):
+          1. Click the 'Lobby' tab in the top-right navigation bar.
+          2. Click the 'Play' (or 'Home') tab — the leftmost option in that bar.
+          3. Press Escape (clears any stale dialog).
+          4. Click the search box; press Backspace 20 times to clear old text.
+          5. Type the variant name into the search box.
+
+        Args:
+            variant_name (str): CLI variant arg (e.g. 'koth', 'Chaturanga').
+                                 'koth' is expanded to 'King of the Hill'; all
+                                 others are used verbatim as the search term.
+
+        Returns:
+            bool: True if all steps completed, False otherwise.
+        """
+        search_term = self._VARIANT_SEARCH.get(variant_name.lower(), variant_name)
+        print(f"[ChessCom] Creating challenge for variant: {variant_name} "
+              f"(search term: '{search_term}')")
+
+        try:
+            # --- Step 1: Click the Lobby tab ---
+            # Use a TreeWalker to locate the raw text node "Lobby", then walk up
+            # to find the first ancestor with a visible bounding box to click.
+            # This is robust against SVG icon content polluting textContent.
+            lobby_result = self.driver.execute_script("""
+                function findTabByLabel(label) {
+                    const re = new RegExp('^' + label + '$', 'i');
+                    const walker = document.createTreeWalker(
+                        document.body, NodeFilter.SHOW_TEXT, null
+                    );
+                    let node;
+                    while ((node = walker.nextNode())) {
+                        if (re.test(node.nodeValue.trim())) {
+                            let el = node.parentElement;
+                            while (el && el !== document.body) {
+                                const rect = el.getBoundingClientRect();
+                                if (rect.width > 0 && rect.height > 0) {
+                                    return {
+                                        found: true,
+                                        x: rect.left + rect.width / 2,
+                                        y: rect.top + rect.height / 2
+                                    };
+                                }
+                                el = el.parentElement;
+                            }
+                        }
+                    }
+                    return { found: false };
+                }
+                return findTabByLabel('Lobby');
+            """)
+
+            if not lobby_result.get('found'):
+                print("[ChessCom] ✗ Lobby tab not found")
+                return False
+
+            x, y = lobby_result['x'], lobby_result['y']
+            print(f"[ChessCom] Clicking Lobby tab at ({x:.0f}, {y:.0f})")
+            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mouseMoved', 'x': x, 'y': y
+            })
+            time.sleep(0.05)
+            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mousePressed', 'x': x, 'y': y,
+                'button': 'left', 'clickCount': 1
+            })
+            time.sleep(0.05)
+            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mouseReleased', 'x': x, 'y': y,
+                'button': 'left', 'clickCount': 1
+            })
+            time.sleep(0.5)
+
+            # --- Step 2: Click the Play / Home tab (leftmost in the bar) ---
+            play_result = self.driver.execute_script("""
+                // The leftmost variants-panel tab is labelled either "Home" or
+                // "Play" depending on server state. Require x > half the viewport
+                // to exclude the left sidebar's own "Play" link.
+                const midX = window.innerWidth / 2;
+                const walker = document.createTreeWalker(
+                    document.body, NodeFilter.SHOW_TEXT, null
+                );
+                let node;
+                while ((node = walker.nextNode())) {
+                    if (/^(home|play)$/i.test(node.nodeValue.trim())) {
+                        let el = node.parentElement;
+                        while (el && el !== document.body) {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0 &&
+                                    rect.left + rect.width / 2 > midX) {
+                                return {
+                                    found: true,
+                                    x: rect.left + rect.width / 2,
+                                    y: rect.top + rect.height / 2
+                                };
+                            }
+                            el = el.parentElement;
+                        }
+                    }
+                }
+                return { found: false };
+            """)
+
+            if not play_result.get('found'):
+                print("[ChessCom] ✗ Play/Home tab not found")
+                return False
+
+            x, y = play_result['x'], play_result['y']
+            print(f"[ChessCom] Clicking Play/Home tab at ({x:.0f}, {y:.0f})")
+            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mouseMoved', 'x': x, 'y': y
+            })
+            time.sleep(0.05)
+            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mousePressed', 'x': x, 'y': y,
+                'button': 'left', 'clickCount': 1
+            })
+            time.sleep(0.05)
+            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mouseReleased', 'x': x, 'y': y,
+                'button': 'left', 'clickCount': 1
+            })
+            time.sleep(0.5)
+
+            # --- Step 3: Escape key (clears any stale dialog before search) ---
+            self.driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
+                'type': 'keyDown',
+                'key': 'Escape',
+                'code': 'Escape',
+                'windowsVirtualKeyCode': 27,
+                'nativeVirtualKeyCode': 27
+            })
+            self.driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
+                'type': 'keyUp',
+                'key': 'Escape',
+                'code': 'Escape',
+                'windowsVirtualKeyCode': 27,
+                'nativeVirtualKeyCode': 27
+            })
+            time.sleep(0.3)
+
+            # --- Step 4: Type the variant name into the search box ---
+            # Find the first visible <input> in the right half of the viewport.
+            search_result = self.driver.execute_script("""
+                const midX = window.innerWidth / 2;
+                for (const inp of document.querySelectorAll('input')) {
+                    const rect = inp.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0 &&
+                            rect.left + rect.width / 2 > midX) {
+                        inp.focus();
+                        return {
+                            found: true,
+                            x: rect.left + rect.width / 2,
+                            y: rect.top + rect.height / 2
+                        };
+                    }
+                }
+                return { found: false };
+            """)
+
+            if not search_result.get('found'):
+                print("[ChessCom] ✗ Variant search box not found")
+                return False
+
+            sx, sy = search_result['x'], search_result['y']
+            print(f"[ChessCom] Clicking search box at ({sx:.0f}, {sy:.0f})")
+            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mousePressed', 'x': sx, 'y': sy,
+                'button': 'left', 'clickCount': 1
+            })
+            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mouseReleased', 'x': sx, 'y': sy,
+                'button': 'left', 'clickCount': 1
+            })
+            time.sleep(0.1)
+
+            # --- Step 4b: Clear any existing text with 20 Backspaces ---
+            print("[ChessCom] Clearing search box (20x Backspace)")
+            for _ in range(20):
+                self.driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
+                    'type': 'keyDown',
+                    'key': 'Backspace',
+                    'code': 'Backspace',
+                    'windowsVirtualKeyCode': 8,
+                    'nativeVirtualKeyCode': 8
+                })
+                self.driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
+                    'type': 'keyUp',
+                    'key': 'Backspace',
+                    'code': 'Backspace',
+                    'windowsVirtualKeyCode': 8,
+                    'nativeVirtualKeyCode': 8
+                })
+                time.sleep(0.05)
+
+            time.sleep(0.2)
+            print(f"[ChessCom] Typing search term: '{search_term}'")
+            for ch in search_term:
+                self.driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
+                    'type': 'char', 'text': ch
+                })
+                time.sleep(0.1)
+
+            self.driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
+                'type': 'keyDown',
+                'key': 'Enter',
+                'code': 'Enter',
+                'windowsVirtualKeyCode': 13,
+                'nativeVirtualKeyCode': 13
+            })
+            self.driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
+                'type': 'keyUp',
+                'key': 'Enter',
+                'code': 'Enter',
+                'windowsVirtualKeyCode': 13,
+                'nativeVirtualKeyCode': 13
+            })
+            time.sleep(0.5)
+
+            # --- Step 4c: Click the variant card that matches variant_name ---
+            # Strategy: find the element whose *own* direct text exactly equals
+            # the variant name (i.e. the big card title), then walk up to the
+            # nearest clickable ancestor to get the correct click coordinates.
+            # This avoids false-positives where the search term appears inside
+            # another card's description (e.g. "crazyhouse" in Rubicon's blurb).
+            CARD_TITLE_MAP = {
+                '3check':    '3 check',
+                'koth':      'king of the hill',
+                'duck':      'duck chess',
+                'xxl':       'xxl chess',
+                'gothic':    'gothic chess',
+                'paradigm':  'paradigm chess30',
+            }
+            target_lower = CARD_TITLE_MAP.get(
+                variant_name.strip().lower(),
+                variant_name.strip().lower()
+            )
+            card = self.driver.execute_script(f"""
+                const target = {repr(target_lower)};
+                const CLICKABLE_TAGS = new Set(['a', 'button', 'li']);
+                const CLICKABLE_ROLES = new Set(['button', 'link', 'tab', 'menuitem', 'option']);
+
+                for (const el of document.querySelectorAll('*')) {{
+                    // Read only the direct text nodes of this element (not descendants)
+                    // so we match the card title, not the full card text block.
+                    let ownText = '';
+                    for (const node of el.childNodes) {{
+                        if (node.nodeType === Node.TEXT_NODE)
+                            ownText += node.textContent;
+                    }}
+                    if (ownText.trim().toLowerCase() !== target) continue;
+
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) continue;
+
+                    // Walk up to the nearest clickable ancestor to capture the
+                    // full card hit-box rather than just the title text element.
+                    let clickTarget = el;
+                    let ancestor = el.parentElement;
+                    while (ancestor && ancestor !== document.body) {{
+                        const tag  = ancestor.tagName.toLowerCase();
+                        const role = (ancestor.getAttribute('role') || '').toLowerCase();
+                        if (CLICKABLE_TAGS.has(tag) || CLICKABLE_ROLES.has(role)) {{
+                            clickTarget = ancestor;
+                            break;
+                        }}
+                        ancestor = ancestor.parentElement;
+                    }}
+
+                    const cr = clickTarget.getBoundingClientRect();
+                    return {{x: cr.left + cr.width / 2, y: cr.top + cr.height / 2,
+                             text: ownText.trim()}};
+                }}
+                return null;
+            """)
+
+            if card:
+                cx, cy = card['x'], card['y']
+                print(f"[ChessCom] Clicking variant card '{card['text']}' at ({cx:.0f}, {cy:.0f})")
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mousePressed', 'x': cx, 'y': cy,
+                    'button': 'left', 'clickCount': 1
+                })
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseReleased', 'x': cx, 'y': cy,
+                    'button': 'left', 'clickCount': 1
+                })
+            else:
+                print(f"[ChessCom] Warning: no matching card found for '{variant_name}'; "
+                      f"the search results may not have loaded yet or the name differs")
+
+            time.sleep(0.5)
+
+            # --- Step 5: Click the Play / Play! button ---
+            # The button appears either inline in the panel ("Play!") or inside a
+            # modal dialog ("Play") depending on the variant.  Find whichever one
+            # is currently visible and click it.
+            play_btn = self.driver.execute_script("""
+                const leftGuard = window.innerWidth / 4;
+                for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+                    let ownText = '';
+                    for (const node of el.childNodes) {
+                        if (node.nodeType === Node.TEXT_NODE)
+                            ownText += node.textContent;
+                    }
+                    const t = ownText.trim();
+                    if (t !== 'Play' && t !== 'Play!') continue;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0) continue;
+                    // Exclude left-sidebar links; 25% is generous enough to catch
+                    // centered modals while still clearing the narrow sidebar
+                    if (rect.left + rect.width / 2 <= leftGuard) continue;
+                    return {x: rect.left + rect.width / 2, y: rect.top + rect.height / 2,
+                            text: t};
+                }
+                return null;
+            """)
+
+            if not play_btn:
+                print("[ChessCom] ✗ Play button not found")
+                return False
+
+            px, py = play_btn['x'], play_btn['y']
+            print(f"[ChessCom] Clicking '{play_btn['text']}' button at ({px:.0f}, {py:.0f})")
+            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mousePressed', 'x': px, 'y': py,
+                'button': 'left', 'clickCount': 1
+            })
+            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mouseReleased', 'x': px, 'y': py,
+                'button': 'left', 'clickCount': 1
+            })
+            time.sleep(0.5)
+
+            # --- Step 6: Click Lobby tab (same as Step 1) ---
+            lobby_result2 = self.driver.execute_script("""
+                function findTabByLabel(label) {
+                    const re = new RegExp('^' + label + '$', 'i');
+                    const walker = document.createTreeWalker(
+                        document.body, NodeFilter.SHOW_TEXT, null
+                    );
+                    let node;
+                    while ((node = walker.nextNode())) {
+                        if (re.test(node.nodeValue.trim())) {
+                            let el = node.parentElement;
+                            while (el && el !== document.body) {
+                                const rect = el.getBoundingClientRect();
+                                if (rect.width > 0 && rect.height > 0) {
+                                    return {
+                                        found: true,
+                                        x: rect.left + rect.width / 2,
+                                        y: rect.top + rect.height / 2
+                                    };
+                                }
+                                el = el.parentElement;
+                            }
+                        }
+                    }
+                    return { found: false };
+                }
+                return findTabByLabel('Lobby');
+            """)
+
+            if not lobby_result2.get('found'):
+                print("[ChessCom] ✗ Lobby tab not found after placing challenge")
+                return False
+
+            lx, ly = lobby_result2['x'], lobby_result2['y']
+            print(f"[ChessCom] Clicking Lobby tab at ({lx:.0f}, {ly:.0f})")
+            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mouseMoved', 'x': lx, 'y': ly
+            })
+            time.sleep(0.05)
+            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mousePressed', 'x': lx, 'y': ly,
+                'button': 'left', 'clickCount': 1
+            })
+            time.sleep(0.05)
+            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mouseReleased', 'x': lx, 'y': ly,
+                'button': 'left', 'clickCount': 1
+            })
+            time.sleep(0.3)
+
+            print(f"[ChessCom] ✓ Challenge placed for {variant_name}")
+            return True
+
+        except Exception as e:
+            print(f"[ChessCom] ✗ Error in create_challenge: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def cancel_challenge(self):
+        """
+        Cancel pending challenge(s) from the lobby by clicking the
+        'Cancel' or 'Cancel All' button.
+
+        Returns:
+            bool: True if the button was found and clicked, False otherwise.
+        """
+        print("[ChessCom] Attempting to click Cancel / Cancel All button...")
+
+        try:
+            result = self.driver.execute_script("""
+                function findBtn(label) {
+                    const lower = label.toLowerCase();
+                    for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+                        if (el.textContent.trim().toLowerCase() !== lower) continue;
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width === 0 || rect.height === 0) continue;
+                        return {found: true,
+                                x: rect.left + rect.width / 2,
+                                y: rect.top + rect.height / 2,
+                                text: label};
+                    }
+                    return null;
+                }
+                // Prefer "Cancel All" so individual per-row buttons are not hit
+                // when a bulk button is present.
+                return findBtn('Cancel All') || findBtn('Cancel') || {found: false};
+            """)
+
+            if not result.get('found'):
+                print("[ChessCom] ✗ Cancel button not found — no pending challenges?")
+                return False
+
+            x, y, label = result['x'], result['y'], result['text']
+            print(f"[ChessCom] Clicking '{label}' button at ({x:.0f}, {y:.0f})")
+            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mouseMoved', 'x': x, 'y': y
+            })
+            time.sleep(0.05)
+            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mousePressed', 'x': x, 'y': y,
+                'button': 'left', 'clickCount': 1
+            })
+            time.sleep(0.05)
+            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                'type': 'mouseReleased', 'x': x, 'y': y,
+                'button': 'left', 'clickCount': 1
+            })
+            time.sleep(0.3)
+            print(f"[ChessCom] ✓ '{label}' button clicked")
+            return True
+
+        except Exception as e:
+            print(f"[ChessCom] ✗ Error in cancel_challenge: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
     def detect_game_started(self):
         """
         Detect if a new game has started by checking for:
