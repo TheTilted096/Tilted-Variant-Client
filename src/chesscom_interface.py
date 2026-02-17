@@ -2620,7 +2620,59 @@ class ChessComInterface:
                 })
 
                 time.sleep(0.5)
-                print("[ChessCom] ✓ Exit button clicked, returning to lobby")
+                print("[ChessCom] ✓ Exit button clicked")
+
+                # --- Click the Lobby tab ---
+                lobby_result = self.driver.execute_script("""
+                    function findTabByLabel(label) {
+                        const re = new RegExp('^' + label + '$', 'i');
+                        const walker = document.createTreeWalker(
+                            document.body, NodeFilter.SHOW_TEXT, null
+                        );
+                        let node;
+                        while ((node = walker.nextNode())) {
+                            if (re.test(node.nodeValue.trim())) {
+                                let el = node.parentElement;
+                                while (el && el !== document.body) {
+                                    const rect = el.getBoundingClientRect();
+                                    if (rect.width > 0 && rect.height > 0) {
+                                        return {
+                                            found: true,
+                                            x: rect.left + rect.width / 2,
+                                            y: rect.top + rect.height / 2
+                                        };
+                                    }
+                                    el = el.parentElement;
+                                }
+                            }
+                        }
+                        return { found: false };
+                    }
+                    return findTabByLabel('Lobby');
+                """)
+
+                if not lobby_result.get('found'):
+                    print("[ChessCom] ✗ Lobby tab not found after exit")
+                    return False
+
+                lx, ly = lobby_result['x'], lobby_result['y']
+                print(f"[ChessCom] Clicking Lobby tab at ({lx}, {ly})")
+
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseMoved', 'x': lx, 'y': ly
+                })
+                time.sleep(0.05)
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mousePressed', 'x': lx, 'y': ly,
+                    'button': 'left', 'clickCount': 1
+                })
+                time.sleep(0.05)
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseReleased', 'x': lx, 'y': ly,
+                    'button': 'left', 'clickCount': 1
+                })
+                time.sleep(0.3)
+                print("[ChessCom] ✓ Lobby tab clicked, returning to lobby")
                 return True
             else:
                 print(f"[ChessCom] ✗ {result.get('error', 'Could not find Exit button')}")
@@ -2868,7 +2920,6 @@ class ChessComInterface:
             # This avoids false-positives where the search term appears inside
             # another card's description (e.g. "crazyhouse" in Rubicon's blurb).
             CARD_TITLE_MAP = {
-                '3check':    '3 check',
                 'koth':      'king of the hill',
                 'duck':      'duck chess',
                 'xxl':       'xxl chess',
