@@ -36,6 +36,7 @@ class VariantsClient:
         self.was_in_game = False
         self.current_game_number = None
         self.last_game_number = None  # Game number that just finished; prevents re-announcing it
+        self.game_over_handled_for = None  # Game number for which game-over was already fully handled
         self.last_state_check = 0
         self.auto_monitor = True  # Enable automatic game state monitoring
         # Background monitoring thread
@@ -182,19 +183,33 @@ class VariantsClient:
     def handle_game_over(self):
         """Handle game over event from MutationObserver."""
         try:
+            game_number = self.current_game_number
+
+            # Require a confirmed game number from chat before doing anything.
+            # Without one there is no verified game in progress, so any detection
+            # is a false positive (e.g. browsing the lobby or variant-selection UI).
+            if game_number is None:
+                return
+
+            # Deduplicate: ignore if we've already handled game-over for this game.
+            if game_number == self.game_over_handled_for:
+                return
+
             # Run full detection to get details
             game_over_info = self.chesscom_interface.detect_game_over()
 
             if game_over_info['game_over']:
-                # Only announce if we were tracking this game
-                if self.was_in_game:
-                    _bg_print("=" * 60)
-                    _bg_print("[Game State] 🏁 GAME OVER!")
-                    if game_over_info['result']:
-                        _bg_print(f"[Game State] Result: {game_over_info['result']}")
-                    _bg_print("=" * 60)
+                # Record before clearing current_game_number so the guard above holds.
+                self.game_over_handled_for = game_number
 
-                # ALWAYS auto-dismiss the dialog
+                _bg_print("=" * 60)
+                _bg_print("[Game State] 🏁 GAME OVER!")
+                _bg_print(f"[Game State] Game #{game_number}")
+                if game_over_info['result']:
+                    _bg_print(f"[Game State] Result: {game_over_info['result']}")
+                _bg_print("=" * 60)
+
+                # Auto-dismiss the dialog
                 if game_over_info['dialog_found']:
                     _bg_print("[Game State] Auto-dismissing game over dialog...")
                     success = self.chesscom_interface.dismiss_game_over_dialog()
@@ -203,8 +218,8 @@ class VariantsClient:
                     else:
                         _bg_print("[Game State] ✗ Failed to dismiss dialog")
 
-                # Reset game state tracking; remember number so we don't re-announce it
-                self.last_game_number = self.current_game_number
+                # Reset game state tracking
+                self.last_game_number = game_number
                 self.was_in_game = False
                 self.current_game_number = None
 
@@ -260,7 +275,8 @@ class VariantsClient:
                 _bg_print("=" * 60)
                 self.was_in_game = True
 
-                # Reset the game over observer for the new game
+                # Reset the game over observer and dedup tracker for the new game
+                self.game_over_handled_for = None
                 self.chesscom_interface.reset_game_over_observer()
 
         except Exception as e:
