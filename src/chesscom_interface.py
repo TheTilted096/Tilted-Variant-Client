@@ -2794,7 +2794,7 @@ class ChessComInterface:
         """Reset the game over observer flags so the next game is detected."""
         try:
             self.driver.execute_script(
-                "window.__gameOver = false; window.__gameOverLogged = false;"
+                "window.__gameOver = false; window.__gameOverLogged = false; window.__gameOverResult = null;"
             )
         except:
             pass
@@ -2817,6 +2817,23 @@ class ChessComInterface:
         // Initialize flags (both exposed on window so Python can reset them)
         window.__gameOver = false;
         window.__gameOverLogged = false;
+        window.__gameOverResult = null;
+
+        function extractResultText(text) {
+            if (text.match(/black won/i))           return 'Black Won';
+            if (text.match(/white won/i))           return 'White Won';
+            if (text.match(/you won/i))             return 'You Won';
+            if (text.match(/you lost/i))            return 'You Lost';
+            if (text.match(/you drew/i))            return 'Draw';
+            if (text.match(/draw by agreement/i))   return 'Draw (By Agreement)';
+            if (text.match(/stalemate/i))           return 'Stalemate';
+            if (text.match(/checkmate/i))           return 'Checkmate';
+            if (text.match(/draw/i))                return 'Draw';
+            if (text.match(/time.*out|flagged/i))   return 'Timeout';
+            if (text.match(/resign/i))              return 'Resigned';
+            if (text.match(/abandon/i))             return 'Abandoned';
+            return 'Game Over';
+        }
 
         // Create the observer
         const observer = new MutationObserver((mutations) => {
@@ -2826,7 +2843,7 @@ class ChessComInterface:
             // Check if any game over dialog has appeared.
             // Use a broad set of class selectors since variants.chess.com may
             // use class names unlike the standard chess.com modal/dialog names.
-            const GAME_OVER_RE = /black won|white won|you won|you lost|you drew|draw|checkmate|stalemate|time.*out|resign/i;
+            const GAME_OVER_RE = /black won|white won|you won|you lost|you drew|draw by agreement|draw|checkmate|stalemate|time.*out|flagged|resign|abandon/i;
 
             const selectors =
                 '[class*="modal"], [class*="dialog"], [class*="popup"], ' +
@@ -2836,9 +2853,11 @@ class ChessComInterface:
             for (const dialog of document.querySelectorAll(selectors)) {
                 const rect = dialog.getBoundingClientRect();
                 if (rect.width > 0 && rect.height > 0) {
-                    if (GAME_OVER_RE.test(dialog.textContent || '')) {
+                    const text = dialog.textContent || '';
+                    if (GAME_OVER_RE.test(text)) {
                         window.__gameOver = true;
                         window.__gameOverLogged = true;
+                        window.__gameOverResult = extractResultText(text);
                         return;
                     }
                 }
@@ -2850,9 +2869,11 @@ class ChessComInterface:
                     '[style*="position: fixed"], [style*="position:fixed"], [style*="z-index"]')) {
                 const rect = el.getBoundingClientRect();
                 if (rect.width > 150 && rect.height > 80) {
-                    if (GAME_OVER_RE.test(el.textContent || '')) {
+                    const text = el.textContent || '';
+                    if (GAME_OVER_RE.test(text)) {
                         window.__gameOver = true;
                         window.__gameOverLogged = true;
+                        window.__gameOverResult = extractResultText(text);
                         return;
                     }
                 }
@@ -2899,17 +2920,29 @@ class ChessComInterface:
                 dialog_coords: null
             };
 
-            const GAME_OVER_RE = /black won|white won|you won|you lost|you drew|draw|checkmate|stalemate|time.*out|resign/i;
+            // If the MutationObserver already detected and cached the result, use it
+            if (window.__gameOverResult) {
+                result.game_over = true;
+                result.dialog_found = true;
+                result.result = window.__gameOverResult;
+                // Still find dialog coords for dismissal
+            }
+
+            const GAME_OVER_RE = /black won|white won|you won|you lost|you drew|draw by agreement|draw|checkmate|stalemate|time.*out|flagged|resign|abandon/i;
 
             function extractResult(text) {
-                if (text.match(/black won/i))  return 'Black Won';
-                if (text.match(/white won/i))  return 'White Won';
-                if (text.match(/you won/i))    return 'You Won';
-                if (text.match(/you lost/i))   return 'You Lost';
-                if (text.match(/you drew/i))   return 'Draw';
-                if (text.match(/stalemate/i))  return 'Stalemate';
-                if (text.match(/draw/i))       return 'Draw';
-                if (text.match(/resign/i))     return 'Resigned';
+                if (text.match(/black won/i))           return 'Black Won';
+                if (text.match(/white won/i))           return 'White Won';
+                if (text.match(/you won/i))             return 'You Won';
+                if (text.match(/you lost/i))            return 'You Lost';
+                if (text.match(/you drew/i))            return 'Draw';
+                if (text.match(/draw by agreement/i))   return 'Draw (By Agreement)';
+                if (text.match(/stalemate/i))           return 'Stalemate';
+                if (text.match(/checkmate/i))           return 'Checkmate';
+                if (text.match(/draw/i))                return 'Draw';
+                if (text.match(/time.*out|flagged/i))   return 'Timeout';
+                if (text.match(/resign/i))              return 'Resigned';
+                if (text.match(/abandon/i))             return 'Abandoned';
                 return 'Game Over';
             }
 
@@ -2920,7 +2953,8 @@ class ChessComInterface:
                 if (!GAME_OVER_RE.test(text)) return false;
                 result.game_over = true;
                 result.dialog_found = true;
-                result.result = extractResult(text);
+                // Prefer the observer-cached result; fall back to re-extracting
+                if (!result.result) result.result = extractResult(text);
                 result.dialog_coords = {
                     left: rect.left, top: rect.top,
                     right: rect.right, bottom: rect.bottom,
@@ -2957,51 +2991,103 @@ class ChessComInterface:
 
     def dismiss_game_over_dialog(self):
         """
-        Dismiss the game over dialog by clicking outside it or on the X button.
+        Dismiss the game over dialog.
+
+        Attempts dismissal in this order:
+          1. Escape key press (works for most modal overlays)
+          2. CDP mouse click on a close/X button found via JS
+          3. Backdrop click (left of the dialog)
 
         Returns:
-            bool: True if dismissal was successful, False otherwise
+            bool: True if a dismissal action was taken, False if nothing was found
         """
         print("[ChessCom] Attempting to dismiss game over dialog...")
 
         try:
-            js_script = """
-            // Find the X button in the dialog
-            const closeButtons = document.querySelectorAll(
-                '[class*="close"], [class*="dismiss"], [aria-label*="close"], ' +
-                '[aria-label*="Close"], button[class*="icon-"]'
-            );
+            # --- Strategy 1: Escape key ---
+            self.driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
+                'type': 'keyDown',
+                'key': 'Escape',
+                'code': 'Escape',
+                'windowsVirtualKeyCode': 27,
+                'nativeVirtualKeyCode': 27
+            })
+            self.driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
+                'type': 'keyUp',
+                'key': 'Escape',
+                'code': 'Escape',
+                'windowsVirtualKeyCode': 27,
+                'nativeVirtualKeyCode': 27
+            })
+            time.sleep(0.3)
 
-            for (const btn of closeButtons) {
-                const rect = btn.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0) {
-                    // Check if this button is in the top-right area of a dialog
-                    const parent = btn.closest('[class*="modal"], [class*="dialog"]');
-                    if (parent) {
-                        const parentRect = parent.getBoundingClientRect();
-                        // X button should be in upper right
-                        if (rect.right > parentRect.right - 50 && rect.top < parentRect.top + 50) {
-                            return {
-                                found: true,
-                                method: 'close_button',
-                                x: rect.left + rect.width / 2,
-                                y: rect.top + rect.height / 2
-                            };
-                        }
+            # Check if the dialog is gone after Escape
+            still_open = self.driver.execute_script("""
+                const GAME_OVER_RE = /black won|white won|you won|you lost|you drew|draw|checkmate|stalemate|time.*out|flagged|resign|abandon/i;
+                const selectors =
+                    '[class*="modal"], [class*="dialog"], [class*="popup"], ' +
+                    '[class*="game-over"], [class*="result"]';
+                for (const el of document.querySelectorAll(selectors)) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0 && GAME_OVER_RE.test(el.textContent || '')) {
+                        return true;
+                    }
+                }
+                return false;
+            """)
+
+            if not still_open:
+                print("[ChessCom] ✓ Dialog dismissed via Escape key")
+                return True
+
+            # --- Strategies 2 & 3: Find the close/X button, then CDP-click it ---
+            js_script = """
+            // Candidates: explicit close/dismiss buttons and aria-labelled buttons
+            const closeSelectors = [
+                '[aria-label="Close"]',
+                '[aria-label="close"]',
+                '[aria-label*="Close"]',
+                '[aria-label*="close"]',
+                '[class*="close"]',
+                '[class*="dismiss"]',
+                'button[class*="icon-"]'
+            ];
+
+            for (const sel of closeSelectors) {
+                for (const btn of document.querySelectorAll(sel)) {
+                    const rect = btn.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) continue;
+
+                    // Must be inside a modal/dialog container
+                    const parent = btn.closest(
+                        '[class*="modal"], [class*="dialog"], [class*="popup"], [class*="game-over"]'
+                    );
+                    if (!parent) continue;
+
+                    const parentRect = parent.getBoundingClientRect();
+                    // X button is typically in upper-right corner of the dialog
+                    if (rect.right > parentRect.right - 60 && rect.top < parentRect.top + 60) {
+                        return {
+                            found: true,
+                            method: 'close_button',
+                            x: rect.left + rect.width / 2,
+                            y: rect.top + rect.height / 2
+                        };
                     }
                 }
             }
 
-            // If no X button found, click outside the dialog (backdrop)
-            const dialogs = document.querySelectorAll('[class*="modal"], [class*="dialog"]');
+            // If no X button found, fall back to backdrop (left of dialog)
+            const dialogs = document.querySelectorAll(
+                '[class*="modal"], [class*="dialog"], [class*="popup"], [class*="game-over"]'
+            );
             for (const dialog of dialogs) {
                 const rect = dialog.getBoundingClientRect();
                 if (rect.width > 0 && rect.height > 0) {
-                    // Click to the left of the dialog (on the backdrop)
                     return {
                         found: true,
                         method: 'backdrop',
-                        x: Math.max(50, rect.left - 50),
+                        x: Math.max(10, rect.left - 60),
                         y: rect.top + rect.height / 2
                     };
                 }
@@ -3017,31 +3103,21 @@ class ChessComInterface:
                 y = result['y']
                 method = result['method']
 
-                print(f"[ChessCom] Clicking to dismiss dialog ({method}) at ({x}, {y})")
+                # Strategy 2: CDP mouse click at the coordinates
+                print(f"[ChessCom] Clicking to dismiss dialog ({method}) at ({x:.0f}, {y:.0f})")
 
-                # Click using CDP
                 self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                    'type': 'mouseMoved',
-                    'x': x,
-                    'y': y
+                    'type': 'mouseMoved', 'x': x, 'y': y
                 })
                 time.sleep(0.05)
-
                 self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                    'type': 'mousePressed',
-                    'x': x,
-                    'y': y,
-                    'button': 'left',
-                    'clickCount': 1
+                    'type': 'mousePressed', 'x': x, 'y': y,
+                    'button': 'left', 'clickCount': 1
                 })
                 time.sleep(0.05)
-
                 self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                    'type': 'mouseReleased',
-                    'x': x,
-                    'y': y,
-                    'button': 'left',
-                    'clickCount': 1
+                    'type': 'mouseReleased', 'x': x, 'y': y,
+                    'button': 'left', 'clickCount': 1
                 })
 
                 time.sleep(0.3)
