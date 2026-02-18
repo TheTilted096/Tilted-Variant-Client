@@ -257,17 +257,21 @@ class VariantsClient:
                 start_info = self.chesscom_interface.detect_game_started()
                 new_number = start_info.get('game_number')
 
+                # Require a confirmed game number - without one we cannot verify
+                # a real game is in progress (could be lobby/variant-selection UI).
+                if not new_number:
+                    return
+
                 # If the detected game number matches the one that just ended,
                 # the page hasn't updated yet - skip until a new number appears.
-                if new_number and new_number == self.last_game_number:
+                if new_number == self.last_game_number:
                     return
 
                 _bg_print("=" * 60)
                 _bg_print("[Game State] 🎮 GAME STARTED!")
-                if new_number:
-                    _bg_print(f"[Game State] Game #{new_number}")
-                    self.current_game_number = new_number
-                    self.last_game_number = None  # Consumed; clear so future games work
+                _bg_print(f"[Game State] Game #{new_number}")
+                self.current_game_number = new_number
+                self.last_game_number = None  # Consumed; clear so future games work
                 if start_info.get('method'):
                     _bg_print(f"[Game State] Detected via: {start_info['method']}")
                 if game_state['color']:
