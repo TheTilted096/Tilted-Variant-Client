@@ -1498,8 +1498,9 @@ class ChessComInterface:
                 'u': 'U',  // Unicorn (for variants)
                 'w': 'W',  // Wazir (for variants)
                 'f': 'F',  // Ferz (for variants)
-                'a': 'H',  // Archbishop (UCI: A → chess.com: H)
-                'c': 'E'   // Chancellor (UCI: C → chess.com: E)
+                'a': 'H',  // Archbishop (UCI: a → chess.com: H)
+                'c': 'E',  // Chancellor (UCI: c → chess.com: E)
+                'd': 'Δ'   // Dragon Bishop (UCI: d → chess.com: Δ)
             };
 
             const targetPiece = pieceMap[promotionPiece];
@@ -3684,4 +3685,755 @@ class ChessComInterface:
                 'color': None,
                 'turn': None
             }
+
+    def get_variant_name(self):
+        """Return a lowercase variant slug from the current page URL/title, or ''."""
+        _KNOWN = (
+            'chaturanga', 'capablanca', 'gothic', 'paradigm', 'courier',
+            'amazon', 'grandchess', 'crazyhouse', 'chess960', 'horde',
+            'kingofthehill', 'threecheck', 'racingkings',
+        )
+        try:
+            url = self.driver.execute_script("return window.location.href") or ''
+            for name in _KNOWN:
+                if name in url.lower():
+                    return name
+            title = self.driver.execute_script("return document.title") or ''
+            for name in _KNOWN:
+                if name in title.lower():
+                    return name
+        except Exception:
+            pass
+        return ''
+
+    @staticmethod
+    def _parse_title_coords(text, num_files, num_ranks, variant=''):
+        """
+        Parse a move string that uses chess.com's internal 14×14 coordinate
+        system and convert it to standard UCI notation.
+
+        Chess.com centers every variant board on a conceptual 14×14 grid.
+        A square that is (file_idx, rank) in 1-based algebraic notation
+        appears as (file_idx + offset_f, rank + offset_r) in the 14×14
+        frame, where:
+
+            offset_f = (14 - num_files) // 2
+            offset_r = (14 - num_ranks) // 2
+
+        Examples
+        --------
+        8×8 board (offset 3, 3):  g8 → j11,  h6 → k9
+        4×4 board (offset 5, 5):  b2 → g7
+
+        The move text format is:
+            [PieceLetter] from_file from_rank [-|x] to_file to_rank [=PromoLetter]
+
+        e.g.  "Nj11-k9"    knight from j11 to k9
+              "j2-j4"      pawn push
+              "j7xk8=Q"    pawn capture-promotion
+
+        Returns
+        -------
+        str | None  UCI move string ("g8h6", "a7a8q", …) or None if the text
+                    cannot be parsed or the converted squares are out of range.
+        """
+        import re
+
+        # ── Normalise chess.com special Unicode piece symbols to ASCII ────────
+        # Δ (Greek capital Delta) is used for the Dragon Bishop; replace it with
+        # 'D' so the regex below can treat it as any other piece-letter prefix.
+        text = text.replace('Δ', 'D').replace('δ', 'd')
+
+        offset_f = (14 - num_files) // 2
+        offset_r = (14 - num_ranks) // 2
+
+        def _conv(f_ch, r_str):
+            """Convert a 14×14 file letter + rank string to an actual square
+            string, e.g. ('k', '9') → 'h6' on an 8×8 board.
+            Returns None when the square falls outside the board."""
+            fi = ord(f_ch.lower()) - ord('a') - offset_f   # 0-based actual file
+            r  = int(r_str) - offset_r                      # 1-based actual rank
+            if not (0 <= fi < num_files and 1 <= r <= num_ranks):
+                return None
+            return chr(ord('a') + fi) + str(r)
+
+        # ── Piece drop: @[irrelevant][piece]-file+rank  →  UCI "Q@e4" notation ─
+        # Example: "@rQ-h8+" → drop a Queen to h8 (14×14) → Q@e5 on an 8×8 board.
+        # The single character immediately after '@' carries no useful information.
+        drop_m = re.match(r'^@.([A-Z])[x\-]([a-n])(\d{1,2})', text, re.IGNORECASE)
+        if drop_m:
+            piece_letter = drop_m.group(1).upper()
+            to_sq = _conv(drop_m.group(2), drop_m.group(3))
+            if to_sq is None:
+                return None
+            return piece_letter + '@' + to_sq
+
+        # ── Standard / capture move ───────────────────────────────────────────
+        # Format: [piece] from_sq [-|x] [captured_piece] to_sq [=promo]
+        # The captured-piece letter (e.g. the "N" in "k8xNj9") is optional and
+        # must be skipped – it is a capital letter immediately after the "x".
+        m = re.match(
+            r'^[A-Za-z]?([a-n])(\d{1,2})[x\-][A-Za-z]?([a-n])(\d{1,2})(?:=([A-Za-z]))?',
+            text
+        )
+        if not m:
+            return None
+        from_f_ch, from_r_str, to_f_ch, to_r_str, promo = m.groups()
+
+        from_sq = _conv(from_f_ch, from_r_str)
+        to_sq   = _conv(to_f_ch,   to_r_str)
+        if from_sq is None or to_sq is None:
+            return None
+
+        uci = from_sq + to_sq
+        if promo:
+            # chess.com promotion letter → internal UCI letter.
+            # E = Chancellor → c   H = Archbishop → a
+            # F = Ferz; in Chaturanga this promotes to a queen-strength piece.
+            # D = Dragon Bishop → d   (all others pass through unchanged)
+            _cc_promo = {'e': 'c', 'h': 'a'}
+            if variant == 'chaturanga':
+                _cc_promo['f'] = 'q'
+            p = promo.lower()
+            uci += _cc_promo.get(p, p)
+        return uci
+
+    def get_last_move(self):
+        """
+        Detect the last move played on the board by combining two sources of
+        information gathered in a single script call:
+
+          1. Move-list text  – the last entry in .moves-table-cell.moves-move,
+             stripped of check/mate markers (+/#).  Used as the ground-truth
+             signal for castling (O-O / O-O-O).
+
+          2. Board highlights – Chess.com's last-move overlay elements.  Used
+             to recover the exact source and destination squares for every move
+             type.
+
+        Move types handled:
+          - 1 highlighted square  → piece-drop  e.g. "Q@f3", "A@e4"
+          - 2 highlighted squares → normal move e.g. "e2e4", "g1f3"
+                                    or promotion e.g. "a7a8q", "a7a8c"
+          - O-O / O-O-O in move list → castling, king→rook UCI encoding
+                                        e.g. "e1h1", "e1a1"
+
+        Returns:
+            str: UCI move string, or None if the move could not be determined.
+        """
+        board_size   = self.detect_board_size()
+        is_flipped   = self.is_board_flipped()
+        variant_name = self.get_variant_name()
+        num_files = board_size.get('files', 8)
+        num_ranks = board_size.get('ranks', 8)
+
+        js_script = f"""
+        return (function() {{
+            // ── chess.com piece letter → UCI character ──────────────────────
+            // Used for class-encoded pieces ("piece wn").
+            // chess.com: E=Chancellor, H=Archbishop; UCI: c=Chancellor, a=Archbishop
+            const chesscomToUci = {{
+                'p': 'p', 'n': 'n', 'b': 'b', 'r': 'r',
+                'q': 'q', 'k': 'k',
+                'e': 'c',   // Chancellor  (chess.com E → UCI c)
+                'h': 'a',   // Archbishop  (chess.com H → UCI a)
+                'u': 'u', 'w': 'w', 'f': 'f', 'd': 'd'
+            }};
+
+            // data-piece values from the TheBoard architecture (uppercase).
+            // Δ is chess.com's symbol for the Dragon Bishop.
+            const dataPieceToUci = {{
+                'R':'r','N':'n','B':'b','Q':'q','K':'k','P':'p',
+                'E':'c', 'H':'a', 'Δ':'d', 'D':'d',
+                'U':'u', 'W':'w', 'F':'f'
+            }};
+
+            // data-color: chess.com's internal player-color codes.
+            const dataColorToStr = {{ '5': 'white', '6': 'black' }};
+
+            const numFiles  = {num_files};
+            const numRanks  = {num_ranks};
+            const isFlipped = {str(is_flipped).lower()};
+
+            // ── Read last move text from move list ──────────────────────────
+            // Reuses the same selector as get_turn().
+            let lastMoveText  = null;
+            let lastMoveTitle = null;   // title attribute – contains raw 14×14 coords
+            const moveTable = document.querySelector('.moves-table');
+            if (moveTable) {{
+                const moveCells = moveTable.querySelectorAll(
+                    '.moves-table-cell.moves-move'
+                );
+                const actualMoves = Array.from(moveCells).filter(
+                    c => c.textContent.trim().length > 0
+                );
+                if (actualMoves.length > 0) {{
+                    const lastCell = actualMoves[actualMoves.length - 1];
+                    const raw = lastCell.textContent.trim();
+                    // Strip check (+) and mate (#) markers – irrelevant to what moved
+                    lastMoveText  = raw.replace(/[+#]/g, '');
+                    // The title attribute lives on an inner child (e.g. the
+                    // .moves-pointer element), not on the outer cell element.
+                    lastMoveTitle = lastCell.getAttribute('title')
+                                 || lastCell.querySelector('[title]')?.getAttribute('title');
+                }}
+            }}
+
+            // ── Locate the board ────────────────────────────────────────────
+            const board = document.querySelector('.TheBoard-squares') ||
+                          document.querySelector('[class*="Board-squares"]') ||
+                          document.querySelector('.board') ||
+                          document.querySelector('[class*="board"]');
+            if (!board) return {{ error: 'Board not found' }};
+
+            // Use the board dimensions from detect_board_size() (coordinate-label
+            // detection).  A previous DOM child-count heuristic was unreliable:
+            // on 10x8 boards the board element's direct children are file-columns
+            // (10 items), not rank-rows, so it returned files/ranks swapped.
+            const numFilesActual = numFiles;
+            const numRanksActual = numRanks;
+
+            const boardRect  = board.getBoundingClientRect();
+            const squareW    = boardRect.width  / numFiles;
+            const squareH    = boardRect.height / numRanks;
+
+            // ── Pixel → algebraic square ────────────────────────────────────
+            function pixelToSquare(cx, cy) {{
+                if (cx < boardRect.left - 2 || cx > boardRect.right  + 2) return null;
+                if (cy < boardRect.top  - 2 || cy > boardRect.bottom + 2) return null;
+
+                const fi = Math.min(Math.floor((cx - boardRect.left) / squareW), numFiles - 1);
+                const ri = Math.min(Math.floor((cy - boardRect.top)  / squareH), numRanks - 1);
+
+                let file, rank;
+                if (isFlipped) {{
+                    file = String.fromCharCode('a'.charCodeAt(0) + (numFiles - 1 - fi));
+                    rank = ri + 1;
+                }} else {{
+                    file = String.fromCharCode('a'.charCodeAt(0) + fi);
+                    rank = numRanks - ri;
+                }}
+                return file + rank;
+            }}
+
+            // ── Extract UCI piece type from element's className ──────────────
+            function pieceTypeFromClass(cls) {{
+                if (typeof cls !== 'string') return null;
+                // Pattern: "piece w<letter>" or "piece b<letter>"
+                const m = cls.match(/piece\\s+[wb]([a-z])/);
+                if (!m) return null;
+                return chesscomToUci[m[1]] || m[1];
+            }}
+
+            // ── Extract color ('white'/'black') from className ──────────────
+            function pieceColorFromClass(cls) {{
+                if (typeof cls !== 'string') return null;
+                const m = cls.match(/piece\\s+([wb])/);
+                if (!m) return null;
+                return m[1] === 'w' ? 'white' : 'black';
+            }}
+
+            // ── Element-level helpers: prefer data-* attrs (TheBoard arch) ──
+            // Falls back to class-based detection for the traditional .board.
+            function pieceTypeFromEl(el) {{
+                const dp = el.getAttribute('data-piece');
+                if (dp) return dataPieceToUci[dp] || null;
+                return pieceTypeFromClass(el.className);
+            }}
+            function pieceColorFromEl(el) {{
+                const dc = el.getAttribute('data-color');
+                if (dc) return dataColorToStr[dc] || null;
+                return pieceColorFromClass(el.className);
+            }}
+
+            // ── Collect highlighted squares ─────────────────────────────────
+            const highlightEls = document.querySelectorAll('[class*="highlight"]');
+            const seenSquares  = new Set();
+            const highlighted  = [];
+            const rawHighlightCount = highlightEls.length;
+
+            // Helper: extract an algebraic square name (e.g. "f3") from a
+            // title/aria-label string, e.g. "Square f3", "f3 highlight", "f3".
+            function sqFromTitle(attr) {{
+                if (!attr) return null;
+                const m = attr.match(/\b([a-n]\d{{1,2}})\b/i);
+                return m ? m[1].toLowerCase() : null;
+            }}
+
+            // Primary: title attribute first (most direct + works for variants),
+            // then pixel-based getBoundingClientRect as fallback.
+            for (const el of highlightEls) {{
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
+                const cx = (rect.left + rect.right)  / 2;
+                const cy = (rect.top  + rect.bottom) / 2;
+
+                // Try title/aria-label on the element and its nearest ancestor
+                let sq = sqFromTitle(el.getAttribute('title'))
+                      || sqFromTitle(el.getAttribute('aria-label'))
+                      || sqFromTitle(el.parentElement?.getAttribute('title'))
+                      || sqFromTitle(el.parentElement?.getAttribute('aria-label'))
+                      || sqFromTitle(el.closest('[title]')?.getAttribute('title'));
+                if (!sq) sq = pixelToSquare(cx, cy);
+
+                if (!sq || seenSquares.has(sq)) continue;
+                seenSquares.add(sq);
+                highlighted.push({{ square: sq,
+                    left: rect.left, right: rect.right,
+                    top:  rect.top,  bottom: rect.bottom }});
+            }}
+
+            // Fallback 1: extract square from CSS class (e.g. 'square-35' → 'c5').
+            // Used when the pixel approach finds nothing – e.g. elements are
+            // inside a shadow DOM or the board rect belongs to a different
+            // container than where the highlights are positioned.
+            if (highlighted.length === 0) {{
+                for (const el of highlightEls) {{
+                    const cls = typeof el.className === 'string' ? el.className : '';
+                    const m = cls.match(/(?:^| )square-(\d+)(?= |$)/);
+                    if (!m) continue;
+                    const code = m[1];
+                    // chess.com square code: last char = rank (1-8),
+                    // leading chars = file index (1=a, 2=b, …, 10=j, …)
+                    const rankNum   = parseInt(code.slice(-1), 10);
+                    const fileDigit = parseInt(code.slice(0, -1), 10);
+                    if (isNaN(rankNum) || isNaN(fileDigit) || fileDigit < 1) continue;
+                    const sq = String.fromCharCode('a'.charCodeAt(0) + fileDigit - 1) + rankNum;
+                    if (seenSquares.has(sq)) continue;
+                    seenSquares.add(sq);
+                    highlighted.push({{ square: sq }});
+                }}
+            }}
+
+            // Fallback 2: scan every square's computed background colour.
+            // Chess.com variants don't add a CSS class or inline style to
+            // highlighted squares; instead the highlight is applied via CSS
+            // rules that change the element's rendered background.
+            // Strategy:
+            //   • collect getComputedStyle().backgroundColor for all squares
+            //   • the two most frequent colours are the normal light/dark tile colours
+            //   • any square with a different colour is a highlight candidate
+            //   • piece presence is determined by a direct rect-overlap test
+            //     against each piece element's getBoundingClientRect() – this
+            //     avoids the globally-built pieceMap which has wrong keys when
+            //     board-size detection is off (e.g. 8×8 detected for a 10×10 board)
+            if (highlighted.length === 0 && board) {{
+                // Snapshot piece visual centres before entering the square loop
+                const pieceCenters = [];
+                for (const el of document.querySelectorAll('[class*="piece"]')) {{
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) continue;
+                    const pt = pieceTypeFromEl(el);
+                    const pc = pieceColorFromEl(el);
+                    if (!pt || !pc) continue;
+                    pieceCenters.push({{
+                        cx: (r.left + r.right) / 2,
+                        cy: (r.top  + r.bottom) / 2,
+                        left: r.left, right: r.right, top: r.top, bottom: r.bottom,
+                        pieceType: pt, pieceColor: pc
+                    }});
+                }}
+
+                const bgCount = {{}};
+                const allSqBgs = [];
+                for (const rankRow of board.children) {{
+                    for (const sqEl of rankRow.children) {{
+                        const bg = window.getComputedStyle(sqEl).backgroundColor;
+                        bgCount[bg] = (bgCount[bg] || 0) + 1;
+                        allSqBgs.push({{ sqEl, bg }});
+                    }}
+                }}
+                // Two most common bg colours = normal square colours
+                const normalBgs = new Set(
+                    Object.entries(bgCount)
+                          .sort((a, b) => b[1] - a[1])
+                          .slice(0, 2)
+                          .map(([c]) => c)
+                );
+                for (const {{ sqEl, bg }} of allSqBgs) {{
+                    if (normalBgs.has(bg)) continue;
+                    const sqRect = sqEl.getBoundingClientRect();
+                    if (sqRect.width === 0 || sqRect.height === 0) continue;
+                    const cx = (sqRect.left + sqRect.right) / 2;
+                    const cy = (sqRect.top  + sqRect.bottom) / 2;
+                    const sq = pixelToSquare(cx, cy);
+                    if (!sq || seenSquares.has(sq)) continue;
+                    seenSquares.add(sq);
+                    // Overlap test: find a piece whose visual centre is inside this square
+                    let piece = null, color = null;
+                    for (const pc of pieceCenters) {{
+                        if (pc.cx >= sqRect.left && pc.cx <= sqRect.right &&
+                            pc.cy >= sqRect.top  && pc.cy <= sqRect.bottom) {{
+                            piece = pc.pieceType;
+                            color = pc.pieceColor;
+                            break;
+                        }}
+                    }}
+                    highlighted.push({{ square: sq, piece, color }});
+                }}
+            }}
+
+            // ── Collect board pieces ────────────────────────────────────────
+            // Map: square → {{ pieceType, pieceColor }}
+            //
+            // Strategy: walk the board DOM (rank-rows → square elements) so
+            // that we can read each square element's title/aria-label for the
+            // square name, and look for piece children inside it.  This avoids
+            // calling pixelToSquare on piece elements whose bounding rect can be
+            // slightly off due to CSS transitions / animations.
+            //
+            // If pieces are NOT children of their square elements (some board
+            // implementations float all pieces at the board root), the fallback
+            // global scan uses the overlap approach instead.
+            const pieceMap = {{}};
+            let piecesFoundViaStructure = 0;
+
+            for (const rankRow of board.children) {{
+                for (const sqEl of rankRow.children) {{
+                    const sqRect = sqEl.getBoundingClientRect();
+                    if (sqRect.width === 0 || sqRect.height === 0) continue;
+
+                    // Square name: title attr > aria-label > pixelToSquare on centre
+                    let sqName = sqFromTitle(sqEl.getAttribute('title'))
+                              || sqFromTitle(sqEl.getAttribute('aria-label'));
+                    if (!sqName) {{
+                        const cx = (sqRect.left + sqRect.right) / 2;
+                        const cy = (sqRect.top  + sqRect.bottom) / 2;
+                        sqName = pixelToSquare(cx, cy);
+                    }}
+                    if (!sqName) continue;
+
+                    // Find a piece that is a descendant of this square element
+                    for (const child of sqEl.querySelectorAll('[class*="piece"]')) {{
+                        const pt = pieceTypeFromEl(child);
+                        const pc = pieceColorFromEl(child);
+                        if (pt && pc) {{
+                            pieceMap[sqName] = {{ pieceType: pt, pieceColor: pc }};
+                            piecesFoundViaStructure++;
+                            break;
+                        }}
+                    }}
+                }}
+            }}
+
+            // Fallback: if no pieces were found as square children (pieces live
+            // at the board root), scan globally and use a spatial overlap test
+            // against the highlighted square rects to assign them.
+            const pieceEls = document.querySelectorAll('[class*="piece"]');
+            if (piecesFoundViaStructure === 0) {{
+                for (const el of pieceEls) {{
+                    const pieceType  = pieceTypeFromEl(el);
+                    const pieceColor = pieceColorFromEl(el);
+                    if (!pieceType || !pieceColor) continue;
+
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0) continue;
+                    const cx = (rect.left + rect.right) / 2;
+                    const cy = (rect.top  + rect.bottom) / 2;
+                    const sq = pixelToSquare(cx, cy);
+                    if (!sq) continue;
+                    pieceMap[sq] = {{ pieceType, pieceColor }};
+                }}
+            }}
+
+            // ── Annotate each highlighted square with its piece ─────────────
+            const annotated = highlighted.map(h => {{
+                const p = pieceMap[h.square];
+                return {{
+                    square: h.square,
+                    piece:  p ? p.pieceType  : null,
+                    color:  p ? p.pieceColor : null
+                }};
+            }});
+
+            // ── Piece-map diagnostic (runs when highlights exist but all lack piece) ──
+            const pieceMapDiag = (annotated.length > 0 && annotated.every(h => !h.piece))
+                ? (() => {{
+                    // TheBoard-pieces is a separate layer; its children are the
+                    // actual piece elements.  Capture their classes so we can
+                    // update pieceTypeFromClass to match.
+                    const piecesLayer = document.querySelector('.TheBoard-pieces');
+                    const layerChildren = piecesLayer
+                        ? Array.from(piecesLayer.children).slice(0, 5).map(c => ({{
+                            cls:       c.className,
+                            title:     c.getAttribute('title'),
+                            ariaLabel: c.getAttribute('aria-label'),
+                            dataAttrs: Object.fromEntries(
+                                Array.from(c.attributes)
+                                     .filter(a => a.name.startsWith('data-'))
+                                     .map(a => [a.name, a.value])
+                            ),
+                            style:     (c.getAttribute('style') || '').slice(0, 80)
+                          }}))
+                        : null;
+                    return {{
+                        pieceMapKeys:          Object.keys(pieceMap).slice(0, 10),
+                        piecesFoundViaStruct:  piecesFoundViaStructure,
+                        totalPieceEls:         pieceEls.length,
+                        samplePieceClass:      pieceEls[0] ? pieceEls[0].className : null,
+                        sampleSqTitle:         board.children[0]?.children[0]?.getAttribute('title'),
+                        sampleSqAriaLabel:     board.children[0]?.children[0]?.getAttribute('aria-label'),
+                        highlightedSquares:    annotated.map(h => h.square),
+                        piecesLayerChildren:   layerChildren
+                    }};
+                  }})()
+                : null;
+
+            // ── Diagnostic: DOM inspection when no highlights found ─────────────
+            let diag = null;
+            if (rawHighlightCount === 0 && board && board.parentElement) {{
+
+                // 1. Class-frequency map inside the board wrapper.
+                //    Elements that appear only 1-2 times are candidates for
+                //    highlight squares (from + to square).
+                const classCounts = {{}};
+                for (const el of board.parentElement.querySelectorAll('*')) {{
+                    for (const cls of el.classList) {{
+                        classCounts[cls] = (classCounts[cls] || 0) + 1;
+                    }}
+                }}
+                const rareClasses = Object.entries(classCounts)
+                    .filter(([, n]) => n <= 4)
+                    .sort((a, b) => a[1] - b[1])
+                    .slice(0, 20);
+
+                // 2. CSS custom properties set via inline style on the board
+                //    and every ancestor up to <body>.
+                const cssVarChain = [];
+                let el = board;
+                while (el && el.tagName !== 'BODY') {{
+                    const st = el.getAttribute('style') || '';
+                    if (st.includes('--')) {{
+                        cssVarChain.push({{
+                            cls:   (el.className || '').slice(0, 60),
+                            style: st.slice(0, 300)
+                        }});
+                    }}
+                    el = el.parentElement;
+                }}
+
+                // 3. Canvas / SVG elements anywhere in the board wrapper.
+                const canvases = Array.from(
+                    board.parentElement.querySelectorAll('canvas, svg')
+                ).map(c => ({{
+                    tag: c.tagName,
+                    id:  c.id,
+                    cls: (c.className && c.className.baseVal !== undefined
+                          ? c.className.baseVal : c.className || '').slice(0, 60),
+                    w:   c.getAttribute('width'),
+                    h:   c.getAttribute('height'),
+                    childCount: c.children.length
+                }}));
+
+                // 4. Computed background of individual squares (catches highlight
+                //    colours applied via CSS rules that don't change className).
+                //    Also samples the ::before pseudo-element background.
+                const squareBgs = [];
+                let ri = 0;
+                for (const rankRow of board.children) {{
+                    let ci = 0;
+                    for (const sq of rankRow.children) {{
+                        const cs   = window.getComputedStyle(sq);
+                        const csBefore = window.getComputedStyle(sq, '::before');
+                        const bg   = cs.backgroundColor;
+                        const bgB  = csBefore.backgroundColor;
+                        const transparent = ['rgba(0, 0, 0, 0)', 'transparent', ''];
+                        if (!transparent.includes(bg) || !transparent.includes(bgB)) {{
+                            squareBgs.push({{ ri, ci, bg, bgBefore: bgB }});
+                        }}
+                        ci++;
+                    }}
+                    ri++;
+                }}
+
+                // 5. Last non-empty move-list cell outer-HTML.
+                const moveCells2 = document.querySelectorAll('.moves-table-cell.moves-move');
+                const lastNonEmpty = Array.from(moveCells2)
+                    .filter(c => c.textContent.trim().length > 0)
+                    .pop();
+                const lastCellHtml = lastNonEmpty ? lastNonEmpty.outerHTML : null;
+
+                diag = {{
+                    rareClasses,
+                    cssVarChain,
+                    canvases,
+                    squareBgs:   squareBgs.slice(0, 10),
+                    lastCellHtml
+                }};
+            }}
+
+            return {{
+                highlights:        annotated,
+                numHighlights:     annotated.length,
+                pieceMap:          pieceMap,
+                lastMoveText:      lastMoveText,
+                lastMoveTitle:     lastMoveTitle,
+                numFilesActual:    numFilesActual,
+                numRanksActual:    numRanksActual,
+                rawHighlightCount: rawHighlightCount,
+                pieceMapDiag:      pieceMapDiag,
+                diag:              diag
+            }};
+        }})();
+        """
+
+        try:
+            data = self.driver.execute_script(js_script)
+        except Exception as e:
+            print(f"[getmove] Script error: {e}")
+            return None
+
+        if not data:
+            print("[getmove] No data returned from board")
+            return None
+
+        if data.get('error'):
+            print(f"[getmove] {data['error']}")
+            return None
+
+        highlights          = data.get('highlights', [])
+        n                   = len(highlights)
+        last_move_text      = (data.get('lastMoveText')  or '').strip()
+        last_move_title     = (data.get('lastMoveTitle') or '').strip()
+        num_files_actual    = data.get('numFilesActual', num_files)
+        num_ranks_actual    = data.get('numRanksActual', num_ranks)
+        raw_highlight_count = data.get('rawHighlightCount', '?')
+
+        if n == 0:
+            print(f"[getmove] Move list text: '{last_move_text}'  "
+                  f"title: '{last_move_title}'  |  0 highlights  "
+                  f"(raw selector matched {raw_highlight_count} element(s))")
+            diag = data.get('diag')
+            if diag:
+                print(f"[getmove] DOM diag: {diag}")
+        else:
+            print(f"[getmove] Move list text: '{last_move_text}'  "
+                  f"title: '{last_move_title}'  |  {n} highlight(s): {highlights}")
+            piece_map_diag = data.get('pieceMapDiag')
+            if piece_map_diag:
+                print(f"[getmove] Piece-map diag: {piece_map_diag}")
+
+        # ── Title-based coordinate parsing (primary for variant boards) ───────
+        # Chess.com stores moves in the move cell's `title` attribute using its
+        # internal 14×14 coordinate frame.  Convert by subtracting the centering
+        # offset derived from the actual board dimensions.
+        for candidate in (last_move_title, last_move_text):
+            if not candidate:
+                continue
+            uci = self._parse_title_coords(candidate, num_files_actual, num_ranks_actual,
+                                           variant=variant_name)
+            if uci:
+                print(f"[getmove] Title coords '{candidate}' → {uci} "
+                      f"(board {num_files_actual}×{num_ranks_actual}, "
+                      f"offset {(14-num_files_actual)//2},{(14-num_ranks_actual)//2})")
+                return uci
+
+        # ── Castling: detected reliably from the move list ───────────────────
+        # NOTE: these are capital letter O characters, not zeroes.
+        # After stripping +/# the only remaining text for castling is 'O-O'
+        # (kingside) or 'O-O-O' (queenside).
+        is_kingside  = (last_move_text == 'O-O')
+        is_queenside = (last_move_text == 'O-O-O')
+
+        if is_kingside or is_queenside:
+            # We use the board highlights to recover exact source squares.
+            # Empty squares = pieces that moved away (king src + rook src).
+            # Piece squares = where each piece landed (king dest + rook dest).
+            with_piece    = [h for h in highlights if h['piece']]
+            without_piece = [h for h in highlights if not h['piece']]
+
+            if len(without_piece) < 2:
+                print("[getmove] Castling: fewer than 2 empty highlighted squares")
+                return None
+
+            # Identify rook source by side, not by how far the king moved.
+            # This works for Chess960 and large boards where the king's travel
+            # distance is not fixed:
+            #   O-O  (kingside):  rook starts on the outer HIGH-file side →
+            #                     rook_src is the empty square with the highest file
+            #   O-O-O (queenside): rook starts on the outer LOW-file side →
+            #                     rook_src is the empty square with the lowest file
+            if is_kingside:
+                rook_src = max(without_piece, key=lambda h: ord(h['square'][0]))
+            else:
+                rook_src = min(without_piece, key=lambda h: ord(h['square'][0]))
+
+            # King source is whichever empty square is not the rook source.
+            king_src_candidates = [
+                h for h in without_piece if h['square'] != rook_src['square']
+            ]
+            if not king_src_candidates:
+                print("[getmove] Castling: cannot identify king source square")
+                return None
+
+            king_src   = king_src_candidates[0]
+            castle_str = 'O-O-O' if is_queenside else 'O-O'
+            move = f"{king_src['square']}{rook_src['square']}"
+            print(f"[getmove] Castling ({castle_str}, king→rook): {move}")
+            return move
+
+        # ── 0 highlights ────────────────────────────────────────────────────
+        if n == 0:
+            print("[getmove] No highlighted squares – no move to read")
+            return None
+
+        # ── 1 highlight → drop move ─────────────────────────────────────────
+        if n == 1:
+            h = highlights[0]
+            if not h['piece']:
+                print(f"[getmove] Drop square {h['square']} has no piece visible")
+                return None
+            # UCI drop format: uppercase piece + '@' + square  (e.g. Q@f3, A@e4)
+            uci_piece = h['piece'].upper()
+            move = f"{uci_piece}@{h['square']}"
+            print(f"[getmove] Drop: {move}")
+            return move
+
+        # ── 2 highlights → normal move / promotion ──────────────────────────
+        if n == 2:
+            with_piece    = [h for h in highlights if h['piece']]
+            without_piece = [h for h in highlights if not h['piece']]
+
+            if len(with_piece) == 0:
+                print("[getmove] Both highlighted squares are empty – cannot determine move")
+                return None
+
+            if len(with_piece) == 2:
+                # Both squares have pieces (can occur briefly during animation).
+                # Log the ambiguity and pick arbitrarily; caller can retry.
+                print(f"[getmove] Both highlighted squares have pieces: {with_piece}")
+                dest = with_piece[0]
+                src  = with_piece[1]
+            else:
+                dest = with_piece[0]
+                src  = without_piece[0]
+
+            from_sq      = src['square']
+            to_sq        = dest['square']
+            ending_piece = dest['piece']
+
+            # ── Promotion detection ────────────────────────────────────────
+            # Heuristic: destination on a back rank, source on the penultimate
+            # rank, and the landing piece is not a pawn.
+            try:
+                dest_rank = int(to_sq[1:])
+                src_rank  = int(from_sq[1:])
+            except ValueError:
+                dest_rank = src_rank = 0
+
+            on_back_rank   = (dest_rank == 1 or dest_rank == num_ranks)
+            from_promo_row = (src_rank  == 2 or src_rank  == num_ranks - 1)
+            is_promotion   = on_back_rank and from_promo_row and ending_piece != 'p'
+
+            if is_promotion:
+                move = f"{from_sq}{to_sq}{ending_piece}"
+                print(f"[getmove] Promotion: {move}")
+            else:
+                move = f"{from_sq}{to_sq}"
+                print(f"[getmove] Normal move: {move}")
+            return move
+
+        # ── Other counts ────────────────────────────────────────────────────
+        print(f"[getmove] Unexpected highlight count ({n}) – returning None")
+        return None
 

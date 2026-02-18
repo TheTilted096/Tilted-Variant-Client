@@ -21,13 +21,13 @@ class UCIHandler:
         # For all board sizes: source square + destination square + optional promotion
         # Files: a-n (supports up to 14 files)
         # Ranks: 1-14 (supports up to 14 ranks)
-        # Promotion pieces: q, r, b, n, k, u, w, f, a, c (variants: Unicorn, Wazir, Ferz, Archbishop, Chancellor)
-        regular_pattern = r'^[a-n][1-9][0-4]?[a-n][1-9][0-4]?[qrbnkuwfac]?$'
+        # Promotion pieces: q, r, b, n, k, u, w, f, a, c, d (variants: Unicorn, Wazir, Ferz, Archbishop, Chancellor, Dragon Bishop)
+        regular_pattern = r'^[a-n][1-9][0-4]?[a-n][1-9][0-4]?[qrbnkuwfacd]?$'
 
         # Drop move pattern for Crazyhouse/variants: P@e5, N@g3, Q@d8, etc.
-        # Format: <PIECE>@<square> where PIECE is Q, R, N, B, P, U, W, F, A, C
+        # Format: <PIECE>@<square> where PIECE is Q, R, N, B, P, U, W, F, A, C, D
         # Pattern is case-insensitive for squares
-        drop_pattern = r'^[QRNBPUWFACqrnbpuwfac]@[a-nA-N][1-9][0-4]?$'
+        drop_pattern = r'^[QRNBPUWFACDqrnbpuwfacd]@[a-nA-N][1-9][0-4]?$'
 
         move_lower = move.lower()
 
@@ -74,7 +74,7 @@ class UCIHandler:
 
             # Parse using regex to handle multi-digit ranks
             # Pattern: <file><rank><file><rank><promotion?>
-            pattern = r'^([a-n])([1-9][0-4]?)([a-n])([1-9][0-4]?)([qrbnkuwfac]?)$'
+            pattern = r'^([a-n])([1-9][0-4]?)([a-n])([1-9][0-4]?)([qrbnkuwfacd]?)$'
             match = re.match(pattern, move_lower)
 
             if not match:
@@ -119,7 +119,8 @@ class UCIHandler:
                 'W': 'Wazir',
                 'F': 'Ferz',
                 'A': 'Archbishop',
-                'C': 'Chancellor'
+                'C': 'Chancellor',
+                'D': 'Dragon Bishop'
             }.get(move_dict['piece'], move_dict['piece'])
             return f"Drop {piece_name} @ {move_dict['to']}"
         else:

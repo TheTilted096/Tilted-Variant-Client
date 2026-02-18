@@ -279,6 +279,14 @@ class VariantsClient:
                 self.game_over_handled_for = None
                 self.chesscom_interface.reset_game_over_observer()
 
+                # Re-initialise the move observer now that the game page is loaded.
+                # The initial setup (at startup) runs before any game is open, so
+                # .moves-table doesn't exist yet and the observer is a no-op.
+                if self.chesscom_interface.setup_move_observer():
+                    _bg_print("[Game State] ✓ Move observer re-initialised")
+                else:
+                    _bg_print("[Game State] ⚠ Could not re-initialise move observer")
+
         except Exception as e:
             # Silently handle errors
             pass
@@ -305,6 +313,7 @@ class VariantsClient:
         print("  - 'debug-playerbox' - Inspect playerbox structure and data-player attributes")
         print("  - 'debug-turn' - Inspect turn detection elements (clocks, active states)")
         print("  - 'debug-gameover' - Test game over detection (run when result dialog is visible)")
+        print("  - 'getmove' - Detect the last move played on the board (UCI format)")
         print("  - 'quit' - Exit the client")
         print()
         if self.auto_monitor:
@@ -434,6 +443,15 @@ class VariantsClient:
                     print(f"[Debug] dialog_found: {result['dialog_found']}")
                     if result['dialog_coords']:
                         print(f"[Debug] dialog position: {result['dialog_coords']}")
+                    print()
+                    continue
+                elif command == 'getmove':
+                    print("[Client] Detecting last move on board...")
+                    move = self.chesscom_interface.get_last_move()
+                    if move:
+                        print(f"[getmove] Last move: {move}")
+                    else:
+                        print("[getmove] Could not detect last move")
                     print()
                     continue
 
