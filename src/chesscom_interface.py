@@ -129,7 +129,6 @@ class ChessComInterface:
             ranks = result.get('ranks', 8)
             method = result.get('method', 'unknown')
 
-            print(f"[Board] Size detected: {files}x{ranks} (method: {method})")
             return result
 
         except Exception as e:
@@ -410,10 +409,6 @@ class ChessComInterface:
             detail = result.get('detail', '')
             debug = result.get('debug', {})
 
-            # Concise orientation summary (detailed debug removed)
-            orientation_str = 'FLIPPED' if is_flipped else 'NORMAL'
-            print(f"[ChessCom] Board orientation: {orientation_str}")
-
             return result
 
         except Exception as e:
@@ -642,9 +637,6 @@ class ChessComInterface:
                 print("[Player] ⚠ Could not determine username")
             return 'unknown'
 
-        if verbose:
-            print(f"[Player] Detected username: {username}")
-
         # Step 2: Find username's playerbox and get data-player attribute
         js_script = f"""
         const username = "{username}";
@@ -715,400 +707,6 @@ class ChessComInterface:
                 import traceback
                 traceback.print_exc()
             return 'unknown'
-
-    def debug_playerbox_structure(self):
-        """
-        Debug function to inspect the actual playerbox DOM structure.
-        Useful for troubleshooting color detection issues.
-        """
-        print("\n" + "="*60)
-        print("[DEBUG] Playerbox Structure Analysis")
-        print("="*60)
-
-        js_script = """
-        const result = {
-            topBox: null,
-            bottomBox: null,
-            allPlayerElements: []
-        };
-
-        // Find top and bottom playerboxes
-        const topBox = document.querySelector('.playerbox-top');
-        const bottomBox = document.querySelector('.playerbox-bottom');
-
-        if (topBox) {
-            result.topBox = {
-                found: true,
-                innerHTML: topBox.innerHTML.substring(0, 500),
-                classes: topBox.className,
-                dataPlayer: topBox.getAttribute('data-player'),
-                userTag: null,
-                allDataPlayers: []
-            };
-
-            // Find user tag
-            const userTag = topBox.querySelector('.playerbox-user-tag');
-            if (userTag) {
-                result.topBox.userTag = {
-                    text: userTag.textContent,
-                    classes: userTag.className
-                };
-            }
-
-            // Find all elements with data-player attribute
-            const dataPlayerElements = topBox.querySelectorAll('[data-player]');
-            dataPlayerElements.forEach(el => {
-                result.topBox.allDataPlayers.push({
-                    tagName: el.tagName,
-                    dataPlayer: el.getAttribute('data-player'),
-                    classes: el.className,
-                    text: el.textContent.substring(0, 50)
-                });
-            });
-        } else {
-            result.topBox = { found: false };
-        }
-
-        if (bottomBox) {
-            result.bottomBox = {
-                found: true,
-                innerHTML: bottomBox.innerHTML.substring(0, 500),
-                classes: bottomBox.className,
-                dataPlayer: bottomBox.getAttribute('data-player'),
-                userTag: null,
-                allDataPlayers: []
-            };
-
-            // Find user tag
-            const userTag = bottomBox.querySelector('.playerbox-user-tag');
-            if (userTag) {
-                result.bottomBox.userTag = {
-                    text: userTag.textContent,
-                    classes: userTag.className
-                };
-            }
-
-            // Find all elements with data-player attribute
-            const dataPlayerElements = bottomBox.querySelectorAll('[data-player]');
-            dataPlayerElements.forEach(el => {
-                result.bottomBox.allDataPlayers.push({
-                    tagName: el.tagName,
-                    dataPlayer: el.getAttribute('data-player'),
-                    classes: el.className,
-                    text: el.textContent.substring(0, 50)
-                });
-            });
-        } else {
-            result.bottomBox = { found: false };
-        }
-
-        // Find ALL elements with data-player anywhere on the page
-        const allPlayerElements = document.querySelectorAll('[data-player]');
-        allPlayerElements.forEach(el => {
-            result.allPlayerElements.push({
-                tagName: el.tagName,
-                dataPlayer: el.getAttribute('data-player'),
-                classes: el.className,
-                text: el.textContent.substring(0, 50),
-                parent: el.parentElement ? el.parentElement.className : null
-            });
-        });
-
-        return result;
-        """
-
-        try:
-            result = self.driver.execute_script(js_script)
-
-            print("\n[TOP PLAYERBOX]")
-            if result['topBox']['found']:
-                print(f"  ✓ Found")
-                print(f"  Classes: {result['topBox']['classes']}")
-                print(f"  data-player on box: {result['topBox']['dataPlayer']}")
-                if result['topBox']['userTag']:
-                    print(f"  User tag text: {result['topBox']['userTag']['text']}")
-                print(f"  Elements with data-player: {len(result['topBox']['allDataPlayers'])}")
-                for el in result['topBox']['allDataPlayers']:
-                    print(f"    - {el['tagName']}: data-player={el['dataPlayer']}, text={el['text'][:30]}")
-            else:
-                print("  ✗ Not found")
-
-            print("\n[BOTTOM PLAYERBOX]")
-            if result['bottomBox']['found']:
-                print(f"  ✓ Found")
-                print(f"  Classes: {result['bottomBox']['classes']}")
-                print(f"  data-player on box: {result['bottomBox']['dataPlayer']}")
-                if result['bottomBox']['userTag']:
-                    print(f"  User tag text: {result['bottomBox']['userTag']['text']}")
-                print(f"  Elements with data-player: {len(result['bottomBox']['allDataPlayers'])}")
-                for el in result['bottomBox']['allDataPlayers']:
-                    print(f"    - {el['tagName']}: data-player={el['dataPlayer']}, text={el['text'][:30]}")
-            else:
-                print("  ✗ Not found")
-
-            print(f"\n[ALL data-player ELEMENTS ON PAGE]")
-            print(f"  Total found: {len(result['allPlayerElements'])}")
-            for el in result['allPlayerElements']:
-                print(f"    - {el['tagName']}: data-player={el['dataPlayer']}")
-                print(f"      classes: {el['classes']}")
-                print(f"      text: {el['text'][:40]}")
-                print(f"      parent: {el['parent']}")
-                print()
-
-            print("="*60 + "\n")
-
-        except Exception as e:
-            print(f"[DEBUG] ✗ Error: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def debug_turn_detection(self):
-        """
-        Debug function to inspect turn detection via move list parity.
-        Useful for troubleshooting turn detection issues.
-        """
-        print("\n" + "="*60)
-        print("[DEBUG] Turn Detection Analysis - Move List Parity")
-        print("="*60)
-
-        detected_turn = self.get_turn()
-
-        js_script = """
-        const result = {
-            moveTable: null,
-            allMoveCells: [],
-            actualMoves: [],
-            lastMove: null
-        };
-
-        // Find the move table
-        const moveTable = document.querySelector('.moves-table');
-
-        if (!moveTable) {
-            result.moveTable = { found: false };
-            return result;
-        }
-
-        result.moveTable = {
-            found: true,
-            classes: moveTable.className
-        };
-
-        // Find all move cells
-        const moveCells = moveTable.querySelectorAll('.moves-table-cell.moves-move');
-
-        result.allMoveCells = Array.from(moveCells).map((cell, index) => ({
-            index: index,
-            text: cell.textContent.trim(),
-            isEmpty: cell.textContent.trim().length === 0,
-            classes: cell.className
-        }));
-
-        // Filter actual moves (non-empty)
-        const actualMoves = Array.from(moveCells).filter(cell =>
-            cell.textContent.trim().length > 0
-        );
-
-        result.actualMoves = Array.from(actualMoves).map((cell, index) => ({
-            index: index,
-            text: cell.textContent.trim(),
-            classes: cell.className,
-            isWhiteMove: index % 2 === 0,
-            nextTurn: index % 2 === 0 ? 'black' : 'white'
-        }));
-
-        if (actualMoves.length > 0) {
-            const lastMoveIndex = actualMoves.length - 1;
-            const lastMove = actualMoves[lastMoveIndex];
-
-            result.lastMove = {
-                index: lastMoveIndex,
-                text: lastMove.textContent.trim(),
-                classes: lastMove.className,
-                isWhiteMove: lastMoveIndex % 2 === 0,
-                nextTurn: lastMoveIndex % 2 === 0 ? 'black' : 'white'
-            };
-        }
-
-        return result;
-        """
-
-        try:
-            result = self.driver.execute_script(js_script)
-
-            print("\n[MOVE TABLE]")
-            if result['moveTable'] and result['moveTable']['found']:
-                print(f"  ✓ Found .moves-table")
-                print(f"  Classes: {result['moveTable']['classes']}")
-            else:
-                print("  ✗ .moves-table not found")
-                print("  ⚠ Make sure game window is large enough for move list to be visible")
-                print("="*60 + "\n")
-                return
-
-            print(f"\n[ALL MOVE CELLS]")
-            print(f"  Total cells found: {len(result['allMoveCells'])}")
-            if len(result['allMoveCells']) > 0:
-                for cell in result['allMoveCells'][:10]:
-                    empty_marker = " (EMPTY)" if cell['isEmpty'] else ""
-                    print(f"    [{cell['index']}] '{cell['text']}'{empty_marker}")
-                if len(result['allMoveCells']) > 10:
-                    print(f"    ... and {len(result['allMoveCells']) - 10} more")
-
-            print(f"\n[ACTUAL MOVES] (non-empty cells)")
-            print(f"  Total actual moves: {len(result['actualMoves'])}")
-            if len(result['actualMoves']) > 0:
-                show_count = min(8, len(result['actualMoves']))
-                for move in result['actualMoves'][:show_count]:
-                    color = "WHITE" if move['isWhiteMove'] else "BLACK"
-                    print(f"    [{move['index']}] {move['text']:8s} ({color}) → Next: {move['nextTurn']}")
-
-                if len(result['actualMoves']) > show_count:
-                    remaining = len(result['actualMoves']) - show_count
-                    print(f"    ... and {remaining} more moves")
-
-            print("\n[LAST MOVE ANALYSIS]")
-            if result['lastMove']:
-                lm = result['lastMove']
-                color = "WHITE" if lm['isWhiteMove'] else "BLACK"
-                print(f"  Last move: '{lm['text']}' (index {lm['index']})")
-                print(f"  Color: {color}")
-                print(f"  Logic: {color} just moved → {lm['nextTurn'].upper()}'s turn")
-            else:
-                print("  No moves yet → White's turn (starting position)")
-
-            print(f"\n[FINAL RESULT]")
-            print(f"  ✓ Detected turn: {detected_turn}")
-
-            print("="*60 + "\n")
-
-        except Exception as e:
-            print(f"[DEBUG] ✗ Error: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def _old_debug_turn_detection_dom(self):
-        """
-        OLD debug function - kept for reference.
-        Inspects DOM elements for turn indicators (CSS classes, etc).
-        """
-        js_script = """
-        const result = {
-            board: null,
-            playerBoxes: [],
-            clocks: [],
-            anyActiveElements: []
-        };
-
-        // Check board element and its classes
-        const board = document.querySelector('.TheBoard') ||
-                     document.querySelector('[class*="board"]');
-        if (board) {
-            result.board = {
-                found: true,
-                classes: board.className,
-                hasWhite: board.className.includes('white'),
-                hasBlack: board.className.includes('black')
-            };
-        }
-
-        // Check player boxes for active/turn indicators
-        const topBox = document.querySelector('.playerbox-top');
-        const bottomBox = document.querySelector('.playerbox-bottom');
-
-        if (topBox) {
-            result.playerBoxes.push({
-                position: 'top',
-                classes: topBox.className,
-                hasActive: topBox.className.includes('active'),
-                hasTurn: topBox.className.includes('turn'),
-                dataPlayer: topBox.querySelector('[data-player]')?.getAttribute('data-player')
-            });
-        }
-
-        if (bottomBox) {
-            result.playerBoxes.push({
-                position: 'bottom',
-                classes: bottomBox.className,
-                hasActive: bottomBox.className.includes('active'),
-                hasTurn: bottomBox.className.includes('turn'),
-                dataPlayer: bottomBox.querySelector('[data-player]')?.getAttribute('data-player')
-            });
-        }
-
-        // Check clock elements
-        const clocks = document.querySelectorAll('[class*="clock"]');
-        clocks.forEach(clock => {
-            const rect = clock.getBoundingClientRect();
-            if (rect.width > 0 && rect.height > 0) {
-                result.clocks.push({
-                    classes: clock.className,
-                    text: clock.textContent.trim(),
-                    hasRunning: clock.className.includes('running'),
-                    hasActive: clock.className.includes('active'),
-                    parent: clock.parentElement?.className || 'none'
-                });
-            }
-        });
-
-        // Find any elements with 'active' or 'turn' in their class
-        const activeElements = document.querySelectorAll('[class*="active"], [class*="turn"]');
-        activeElements.forEach(el => {
-            if (el.className.includes('player') ||
-                el.className.includes('board') ||
-                el.className.includes('clock')) {
-                result.anyActiveElements.push({
-                    tagName: el.tagName,
-                    classes: el.className,
-                    text: el.textContent.substring(0, 30)
-                });
-            }
-        });
-
-        return result;
-        """
-
-        try:
-            result = self.driver.execute_script(js_script)
-
-            print("\n[BOARD ELEMENT]")
-            if result['board']:
-                print(f"  ✓ Found")
-                print(f"  Classes: {result['board']['classes']}")
-                print(f"  Has 'white': {result['board']['hasWhite']}")
-                print(f"  Has 'black': {result['board']['hasBlack']}")
-            else:
-                print("  ✗ Not found")
-
-            print("\n[PLAYER BOXES]")
-            for box in result['playerBoxes']:
-                print(f"  {box['position'].upper()} box:")
-                print(f"    Classes: {box['classes']}")
-                print(f"    Has 'active': {box['hasActive']}")
-                print(f"    Has 'turn': {box['hasTurn']}")
-                print(f"    data-player: {box['dataPlayer']}")
-
-            print("\n[CLOCKS]")
-            print(f"  Total found: {len(result['clocks'])}")
-            for i, clock in enumerate(result['clocks']):
-                print(f"  Clock {i+1}:")
-                print(f"    Classes: {clock['classes']}")
-                print(f"    Time: {clock['text']}")
-                print(f"    Has 'running': {clock['hasRunning']}")
-                print(f"    Has 'active': {clock['hasActive']}")
-                print(f"    Parent: {clock['parent']}")
-
-            print("\n[ELEMENTS WITH 'active' OR 'turn']")
-            print(f"  Total found: {len(result['anyActiveElements'])}")
-            for el in result['anyActiveElements']:
-                print(f"    - {el['tagName']}: {el['classes'][:80]}")
-
-            print("="*60 + "\n")
-
-        except Exception as e:
-            print(f"[DEBUG] ✗ Error: {e}")
-            import traceback
-            traceback.print_exc()
 
     def is_board_flipped(self):
         """
@@ -2080,11 +1678,9 @@ class ChessComInterface:
         Returns:
             bool: True if drop was successful, False otherwise
         """
-        print(f"[ChessCom] Drop move: {piece_type}@{to_square}")
-
         try:
             # Get player color
-            player_color = self.get_player_color()
+            player_color = self.get_player_color(verbose=False)
             if player_color == 'unknown':
                 print(f"[ChessCom] ✗ Cannot determine player color")
                 return False
@@ -2688,10 +2284,21 @@ class ChessComInterface:
 
     # Maps CLI shorthand → text to type into the variant search box.
     _VARIANT_SEARCH = {
-        'koth': 'King of the Hill',
+        # Abbreviated command → full search term typed into the search box
+        'koth':        'King of the Hill',
+        'chaturanga':  'Chaturanga',
+        'gothic':      'Gothic Chess',
+        'duck':        'Duck Chess',
+        'xxl':         'XXL Chess',
+        'paradigm':    'Paradigm Chess30',
+        'crazyhouse':  'Crazyhouse',
+        '3check':      '3-Check',
+        'atomic':      'Atomic',
+        'horde':       'Horde',
+        'racing':      'Racing Kings',
     }
 
-    def create_challenge(self, variant_name):
+    def create_challenge(self, variant_name, abort_check=None):
         """
         Begin the challenge-creation flow for the given variant.
 
@@ -2706,6 +2313,10 @@ class ChessComInterface:
             variant_name (str): CLI variant arg (e.g. 'koth', 'Chaturanga').
                                  'koth' is expanded to 'King of the Hill'; all
                                  others are used verbatim as the search term.
+            abort_check (callable | None): optional zero-argument callable that
+                returns True when the caller wants to abort mid-flow (e.g. a
+                game was detected).  Checked between each major step; if it
+                fires the function returns False immediately without typing.
 
         Returns:
             bool: True if all steps completed, False otherwise.
@@ -2766,7 +2377,7 @@ class ChessComInterface:
                 'type': 'mouseReleased', 'x': x, 'y': y,
                 'button': 'left', 'clickCount': 1
             })
-            time.sleep(0.5)
+            time.sleep(0.2)
 
             # --- Step 2: Click the Play / Home tab (leftmost in the bar) ---
             play_result = self.driver.execute_script("""
@@ -2817,7 +2428,11 @@ class ChessComInterface:
                 'type': 'mouseReleased', 'x': x, 'y': y,
                 'button': 'left', 'clickCount': 1
             })
-            time.sleep(0.5)
+            time.sleep(0.2)
+
+            if abort_check and abort_check():
+                print("[ChessCom] Abort: game detected after Lobby click — stopping challenge")
+                return False
 
             # --- Step 3: Escape key (clears any stale dialog before search) ---
             self.driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
@@ -2834,10 +2449,16 @@ class ChessComInterface:
                 'windowsVirtualKeyCode': 27,
                 'nativeVirtualKeyCode': 27
             })
-            time.sleep(0.3)
+            time.sleep(0.15)
+
+            if abort_check and abort_check():
+                print("[ChessCom] Abort: game detected after Play/Home click — stopping challenge")
+                return False
 
             # --- Step 4: Type the variant name into the search box ---
             # Find the first visible <input> in the right half of the viewport.
+            # Also call inp.select() so any existing text is pre-selected and
+            # a single Delete key will clear it without needing many Backspaces.
             search_result = self.driver.execute_script("""
                 const midX = window.innerWidth / 2;
                 for (const inp of document.querySelectorAll('input')) {
@@ -2845,6 +2466,11 @@ class ChessComInterface:
                     if (rect.width > 0 && rect.height > 0 &&
                             rect.left + rect.width / 2 > midX) {
                         inp.focus();
+                        // Clear via native setter so React sees the change
+                        const setter = Object.getOwnPropertyDescriptor(
+                            HTMLInputElement.prototype, 'value').set;
+                        setter.call(inp, '');
+                        inp.dispatchEvent(new Event('input', { bubbles: true }));
                         return {
                             found: true,
                             x: rect.left + rect.width / 2,
@@ -2859,44 +2485,27 @@ class ChessComInterface:
                 print("[ChessCom] ✗ Variant search box not found")
                 return False
 
-            sx, sy = search_result['x'], search_result['y']
-            print(f"[ChessCom] Clicking search box at ({sx:.0f}, {sy:.0f})")
-            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                'type': 'mousePressed', 'x': sx, 'y': sy,
-                'button': 'left', 'clickCount': 1
-            })
-            self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                'type': 'mouseReleased', 'x': sx, 'y': sy,
-                'button': 'left', 'clickCount': 1
-            })
-            time.sleep(0.1)
+            # The JS already focused and cleared the input via the native setter.
+            # Give React one tick to reconcile before typing.
+            time.sleep(0.05)
 
-            # --- Step 4b: Clear any existing text with 20 Backspaces ---
-            print("[ChessCom] Clearing search box (20x Backspace)")
-            for _ in range(20):
-                self.driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
-                    'type': 'keyDown',
-                    'key': 'Backspace',
-                    'code': 'Backspace',
-                    'windowsVirtualKeyCode': 8,
-                    'nativeVirtualKeyCode': 8
-                })
-                self.driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
-                    'type': 'keyUp',
-                    'key': 'Backspace',
-                    'code': 'Backspace',
-                    'windowsVirtualKeyCode': 8,
-                    'nativeVirtualKeyCode': 8
-                })
-                time.sleep(0.05)
+            # Last chance to abort before any keypresses are sent — typing into
+            # the wrong focused element (e.g. game chat) would be visible to the
+            # opponent and a clear tell of automation.
+            if abort_check and abort_check():
+                print("[ChessCom] Abort: game detected before typing — stopping challenge")
+                return False
 
-            time.sleep(0.2)
             print(f"[ChessCom] Typing search term: '{search_term}'")
             for ch in search_term:
                 self.driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
                     'type': 'char', 'text': ch
                 })
-                time.sleep(0.1)
+                time.sleep(0.03)
+
+            if abort_check and abort_check():
+                print("[ChessCom] Abort: game detected before Enter — stopping challenge")
+                return False
 
             self.driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
                 'type': 'keyDown',
@@ -2916,10 +2525,9 @@ class ChessComInterface:
 
             # --- Step 4c: Click the variant card that matches variant_name ---
             # Strategy: find the element whose *own* direct text exactly equals
-            # the variant name (i.e. the big card title), then walk up to the
-            # nearest clickable ancestor to get the correct click coordinates.
-            # This avoids false-positives where the search term appears inside
-            # another card's description (e.g. "crazyhouse" in Rubicon's blurb).
+            # the variant name (i.e. the big card title), then click it directly.
+            # Clicking the title element lands on the right-hand text side of the
+            # card, avoiding the icon on the left that can mis-navigate.
             CARD_TITLE_MAP = {
                 'koth':      'king of the hill',
                 'duck':      'duck chess',
@@ -2933,8 +2541,6 @@ class ChessComInterface:
             )
             card = self.driver.execute_script(f"""
                 const target = {repr(target_lower)};
-                const CLICKABLE_TAGS = new Set(['a', 'button', 'li']);
-                const CLICKABLE_ROLES = new Set(['button', 'link', 'tab', 'menuitem', 'option']);
 
                 for (const el of document.querySelectorAll('*')) {{
                     // Read only the direct text nodes of this element (not descendants)
@@ -2946,25 +2552,12 @@ class ChessComInterface:
                     }}
                     if (ownText.trim().toLowerCase() !== target) continue;
 
+                    // Click the title element itself — it sits on the right side of
+                    // the card, away from the icon on the left.
                     const r = el.getBoundingClientRect();
                     if (r.width === 0 || r.height === 0) continue;
 
-                    // Walk up to the nearest clickable ancestor to capture the
-                    // full card hit-box rather than just the title text element.
-                    let clickTarget = el;
-                    let ancestor = el.parentElement;
-                    while (ancestor && ancestor !== document.body) {{
-                        const tag  = ancestor.tagName.toLowerCase();
-                        const role = (ancestor.getAttribute('role') || '').toLowerCase();
-                        if (CLICKABLE_TAGS.has(tag) || CLICKABLE_ROLES.has(role)) {{
-                            clickTarget = ancestor;
-                            break;
-                        }}
-                        ancestor = ancestor.parentElement;
-                    }}
-
-                    const cr = clickTarget.getBoundingClientRect();
-                    return {{x: cr.left + cr.width / 2, y: cr.top + cr.height / 2,
+                    return {{x: r.left + r.width / 2, y: r.top + r.height / 2,
                              text: ownText.trim()}};
                 }}
                 return null;
@@ -2985,7 +2578,7 @@ class ChessComInterface:
                 print(f"[ChessCom] Warning: no matching card found for '{variant_name}'; "
                       f"the search results may not have loaded yet or the name differs")
 
-            time.sleep(0.5)
+            time.sleep(0.2)
 
             # --- Step 5: Click the Play / Play! button ---
             # The button appears either inline in the panel ("Play!") or inside a
@@ -3026,7 +2619,7 @@ class ChessComInterface:
                 'type': 'mouseReleased', 'x': px, 'y': py,
                 'button': 'left', 'clickCount': 1
             })
-            time.sleep(0.5)
+            time.sleep(0.2)
 
             # --- Step 6: Click Lobby tab (same as Step 1) ---
             lobby_result2 = self.driver.execute_script("""
@@ -3691,7 +3284,7 @@ class ChessComInterface:
         _KNOWN = (
             'chaturanga', 'capablanca', 'gothic', 'paradigm', 'courier',
             'amazon', 'grandchess', 'crazyhouse', 'chess960', 'horde',
-            'kingofthehill', 'threecheck', 'racingkings',
+            'kingofthehill', 'threecheck', 'racingkings', 'giveaway', 'antichess',
         )
         try:
             url = self.driver.execute_script("return window.location.href") or ''
@@ -3705,6 +3298,81 @@ class ChessComInterface:
         except Exception:
             pass
         return ''
+
+    def get_ingame_variant_label(self):
+        """Read the human-readable variant name shown in the top-right of the game page.
+
+        Scans the right half of the viewport for an element whose sole direct
+        text matches one of the known chess.com variant display names (e.g.
+        'Gothic Chess', 'Chaturanga').  Falls back to URL/title slug detection
+        via get_variant_name() when no DOM match is found.
+
+        Returns:
+            str: Display name such as 'Gothic Chess', or the slug from
+                 get_variant_name(), or '' if detection fails entirely.
+        """
+        # Human-readable names as they appear on chess.com
+        DISPLAY_NAMES = [
+            'Chaturanga', 'Capablanca Chess', 'Gothic Chess', 'Paradigm Chess30',
+            'Courier Chess', 'Amazon Chess', 'Grand Chess', 'Crazyhouse',
+            'Chess960', 'Fischerandom', 'Horde', 'King of the Hill',
+            '3-Check', 'Three-Check', 'Racing Kings', 'Duck Chess',
+            'XXL Chess', 'Atomic Chess', 'Atomic', 'Bughouse', 'Antichess', 'Giveaway',
+        ]
+        try:
+            result = self.driver.execute_script("""
+                const names = arguments[0];
+                const midX  = window.innerWidth / 2;
+                const lower = names.map(n => n.toLowerCase());
+
+                // First pass: right half of viewport only (true "top-right" label)
+                for (const el of document.querySelectorAll('*')) {
+                    // Match elements whose OWN direct text (not descendants) equals a name
+                    let ownText = '';
+                    for (const node of el.childNodes) {
+                        if (node.nodeType === Node.TEXT_NODE)
+                            ownText += node.textContent;
+                    }
+                    ownText = ownText.trim();
+                    if (!ownText) continue;
+
+                    const idx = lower.indexOf(ownText.toLowerCase());
+                    if (idx === -1) continue;
+
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0) continue;
+                    if (rect.left + rect.width / 2 > midX) {
+                        return names[idx];   // Return the canonical display name
+                    }
+                }
+
+                // Second pass: anywhere on page (handles centred/narrow layouts)
+                for (const el of document.querySelectorAll('*')) {
+                    let ownText = '';
+                    for (const node of el.childNodes) {
+                        if (node.nodeType === Node.TEXT_NODE)
+                            ownText += node.textContent;
+                    }
+                    ownText = ownText.trim();
+                    if (!ownText) continue;
+
+                    const idx = lower.indexOf(ownText.toLowerCase());
+                    if (idx === -1) continue;
+
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0)
+                        return names[idx];
+                }
+                return null;
+            """, DISPLAY_NAMES)
+
+            if result:
+                return result
+        except Exception:
+            pass
+
+        # Fallback: URL / title slug
+        return self.get_variant_name()
 
     @staticmethod
     def _parse_title_coords(text, num_files, num_ranks, variant=''):
@@ -3798,7 +3466,7 @@ class ChessComInterface:
             uci += _cc_promo.get(p, p)
         return uci
 
-    def get_last_move(self):
+    def get_last_move(self, verbose=True):
         """
         Detect the last move played on the board by combining two sources of
         information gathered in a single script call:
@@ -3859,6 +3527,7 @@ class ChessComInterface:
             // Reuses the same selector as get_turn().
             let lastMoveText  = null;
             let lastMoveTitle = null;   // title attribute – contains raw 14×14 coords
+            let actualMovesLength = 0;  // total moves played (used to determine castling color)
             const moveTable = document.querySelector('.moves-table');
             if (moveTable) {{
                 const moveCells = moveTable.querySelectorAll(
@@ -3867,6 +3536,7 @@ class ChessComInterface:
                 const actualMoves = Array.from(moveCells).filter(
                     c => c.textContent.trim().length > 0
                 );
+                actualMovesLength = actualMoves.length;
                 if (actualMoves.length > 0) {{
                     const lastCell = actualMoves[actualMoves.length - 1];
                     const raw = lastCell.textContent.trim();
@@ -4271,6 +3941,7 @@ class ChessComInterface:
                 numFilesActual:    numFilesActual,
                 numRanksActual:    numRanksActual,
                 rawHighlightCount: rawHighlightCount,
+                actualMovesLength: actualMovesLength,
                 pieceMapDiag:      pieceMapDiag,
                 diag:              diag
             }};
@@ -4280,38 +3951,26 @@ class ChessComInterface:
         try:
             data = self.driver.execute_script(js_script)
         except Exception as e:
-            print(f"[getmove] Script error: {e}")
+            if verbose:
+                print(f"[getmove] Script error: {e}")
             return None
 
         if not data:
-            print("[getmove] No data returned from board")
+            if verbose:
+                print("[getmove] No data returned from board")
             return None
 
         if data.get('error'):
-            print(f"[getmove] {data['error']}")
+            if verbose:
+                print(f"[getmove] {data['error']}")
             return None
 
-        highlights          = data.get('highlights', [])
-        n                   = len(highlights)
-        last_move_text      = (data.get('lastMoveText')  or '').strip()
-        last_move_title     = (data.get('lastMoveTitle') or '').strip()
-        num_files_actual    = data.get('numFilesActual', num_files)
-        num_ranks_actual    = data.get('numRanksActual', num_ranks)
-        raw_highlight_count = data.get('rawHighlightCount', '?')
-
-        if n == 0:
-            print(f"[getmove] Move list text: '{last_move_text}'  "
-                  f"title: '{last_move_title}'  |  0 highlights  "
-                  f"(raw selector matched {raw_highlight_count} element(s))")
-            diag = data.get('diag')
-            if diag:
-                print(f"[getmove] DOM diag: {diag}")
-        else:
-            print(f"[getmove] Move list text: '{last_move_text}'  "
-                  f"title: '{last_move_title}'  |  {n} highlight(s): {highlights}")
-            piece_map_diag = data.get('pieceMapDiag')
-            if piece_map_diag:
-                print(f"[getmove] Piece-map diag: {piece_map_diag}")
+        highlights       = data.get('highlights', [])
+        n                = len(highlights)
+        last_move_text   = (data.get('lastMoveText')  or '').strip()
+        last_move_title  = (data.get('lastMoveTitle') or '').strip()
+        num_files_actual = data.get('numFilesActual', num_files)
+        num_ranks_actual = data.get('numRanksActual', num_ranks)
 
         # ── Title-based coordinate parsing (primary for variant boards) ───────
         # Chess.com stores moves in the move cell's `title` attribute using its
@@ -4323,9 +3982,6 @@ class ChessComInterface:
             uci = self._parse_title_coords(candidate, num_files_actual, num_ranks_actual,
                                            variant=variant_name)
             if uci:
-                print(f"[getmove] Title coords '{candidate}' → {uci} "
-                      f"(board {num_files_actual}×{num_ranks_actual}, "
-                      f"offset {(14-num_files_actual)//2},{(14-num_ranks_actual)//2})")
                 return uci
 
         # ── Castling: detected reliably from the move list ───────────────────
@@ -4336,58 +3992,60 @@ class ChessComInterface:
         is_queenside = (last_move_text == 'O-O-O')
 
         if is_kingside or is_queenside:
-            # We use the board highlights to recover exact source squares.
+            # Determine which color just castled.
+            # White plays on odd-numbered moves (1st, 3rd, …), so if the total
+            # move count is odd the last move was White's; even → Black's.
+            move_count   = data.get('actualMovesLength', 0)
+            white_castle = (move_count % 2 == 1)
+
+            # ── 8×8 standard chess ───────────────────────────────────────────
+            if num_files_actual == 8 and num_ranks_actual == 8:
+                if white_castle:
+                    return 'e1g1' if is_kingside else 'e1c1'
+                else:
+                    return 'e8g8' if is_kingside else 'e8c8'
+
+            # ── Gothic Chess / Capablanca (10×8) ─────────────────────────────
+            if num_files_actual == 10 and num_ranks_actual == 8:
+                if white_castle:
+                    return 'f1i1' if is_kingside else 'f1c1'
+                else:
+                    return 'f8i8' if is_kingside else 'f8c8'
+
+            # ── Other board sizes: derive squares from highlights ─────────────
             # Empty squares = pieces that moved away (king src + rook src).
-            # Piece squares = where each piece landed (king dest + rook dest).
             with_piece    = [h for h in highlights if h['piece']]
             without_piece = [h for h in highlights if not h['piece']]
 
             if len(without_piece) < 2:
-                print("[getmove] Castling: fewer than 2 empty highlighted squares")
                 return None
 
-            # Identify rook source by side, not by how far the king moved.
-            # This works for Chess960 and large boards where the king's travel
-            # distance is not fixed:
-            #   O-O  (kingside):  rook starts on the outer HIGH-file side →
-            #                     rook_src is the empty square with the highest file
-            #   O-O-O (queenside): rook starts on the outer LOW-file side →
-            #                     rook_src is the empty square with the lowest file
+            # Rook source: outermost empty square on the castling side.
             if is_kingside:
                 rook_src = max(without_piece, key=lambda h: ord(h['square'][0]))
             else:
                 rook_src = min(without_piece, key=lambda h: ord(h['square'][0]))
 
-            # King source is whichever empty square is not the rook source.
             king_src_candidates = [
                 h for h in without_piece if h['square'] != rook_src['square']
             ]
             if not king_src_candidates:
-                print("[getmove] Castling: cannot identify king source square")
                 return None
 
-            king_src   = king_src_candidates[0]
-            castle_str = 'O-O-O' if is_queenside else 'O-O'
-            move = f"{king_src['square']}{rook_src['square']}"
-            print(f"[getmove] Castling ({castle_str}, king→rook): {move}")
-            return move
+            king_src = king_src_candidates[0]
+            return f"{king_src['square']}{rook_src['square']}"
 
         # ── 0 highlights ────────────────────────────────────────────────────
         if n == 0:
-            print("[getmove] No highlighted squares – no move to read")
             return None
 
         # ── 1 highlight → drop move ─────────────────────────────────────────
         if n == 1:
             h = highlights[0]
             if not h['piece']:
-                print(f"[getmove] Drop square {h['square']} has no piece visible")
                 return None
-            # UCI drop format: uppercase piece + '@' + square  (e.g. Q@f3, A@e4)
             uci_piece = h['piece'].upper()
-            move = f"{uci_piece}@{h['square']}"
-            print(f"[getmove] Drop: {move}")
-            return move
+            return f"{uci_piece}@{h['square']}"
 
         # ── 2 highlights → normal move / promotion ──────────────────────────
         if n == 2:
@@ -4395,13 +4053,9 @@ class ChessComInterface:
             without_piece = [h for h in highlights if not h['piece']]
 
             if len(with_piece) == 0:
-                print("[getmove] Both highlighted squares are empty – cannot determine move")
                 return None
 
             if len(with_piece) == 2:
-                # Both squares have pieces (can occur briefly during animation).
-                # Log the ambiguity and pick arbitrarily; caller can retry.
-                print(f"[getmove] Both highlighted squares have pieces: {with_piece}")
                 dest = with_piece[0]
                 src  = with_piece[1]
             else:
@@ -4412,9 +4066,8 @@ class ChessComInterface:
             to_sq        = dest['square']
             ending_piece = dest['piece']
 
-            # ── Promotion detection ────────────────────────────────────────
-            # Heuristic: destination on a back rank, source on the penultimate
-            # rank, and the landing piece is not a pawn.
+            # Promotion heuristic: destination on a back rank, source on the
+            # penultimate rank, and the landing piece is not a pawn.
             try:
                 dest_rank = int(to_sq[1:])
                 src_rank  = int(from_sq[1:])
@@ -4426,14 +4079,8 @@ class ChessComInterface:
             is_promotion   = on_back_rank and from_promo_row and ending_piece != 'p'
 
             if is_promotion:
-                move = f"{from_sq}{to_sq}{ending_piece}"
-                print(f"[getmove] Promotion: {move}")
-            else:
-                move = f"{from_sq}{to_sq}"
-                print(f"[getmove] Normal move: {move}")
-            return move
+                return f"{from_sq}{to_sq}{ending_piece}"
+            return f"{from_sq}{to_sq}"
 
-        # ── Other counts ────────────────────────────────────────────────────
-        print(f"[getmove] Unexpected highlight count ({n}) – returning None")
         return None
 
