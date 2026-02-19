@@ -62,6 +62,24 @@ class VariantsClient:
         # starts.  The engine callback captures this value so it can detect
         # whether the game it was searching for is still the current one.
         self._game_generation = 0
+        # Timing: milliseconds spent detecting the last opponent move.
+        self._detect_ms = 0
+        # Promo banner recovery: set True when a membership banner is detected
+        # so the loop can restart the challenge phase immediately.
+        self._loop_restart_required = False
+        # Timestamp of the last promo-banner check (monotonic seconds).
+        self._last_promo_check = 0.0
+        # Guard against false game-over signals during the new-game setup
+        # window.  Set to False as soon as a new game number is confirmed,
+        # and back to True only after setup_game_over_observer() completes.
+        # handle_game_over() is a no-op while this is False, preventing stale
+        # DOM / cached __gameOverResult from the previous game from being
+        # misread as the new game having immediately ended.
+        self._new_game_settled = True
+        # Monotonic timestamp of when the current game's setup completed and
+        # game-over detection was re-enabled.  Used to enforce a minimum game
+        # age before accepting any game-over signal (see handle_game_over).
+        self._game_start_time = 0.0
 
     def start(self):
         """Start the variants client."""
@@ -196,6 +214,14 @@ class VariantsClient:
             # Also periodically check for game start
             self.check_for_game_start()
 
+            # Periodically check for a full-screen membership promo banner
+            # (only when not actively in a game to avoid false positives).
+            if not self.was_in_game:
+                now = time.monotonic()
+                if now - self._last_promo_check >= 3.0:
+                    self._last_promo_check = now
+                    self._check_for_promo_banner()
+
         except Exception as e:
             # Only print non-session errors (session errors are expected on shutdown)
             if 'invalid session' not in str(e).lower():
@@ -257,10 +283,11 @@ class VariantsClient:
                 return
             # It's our turn → the opponent just moved; collect their move.
             if color == turn:
+                t_detect_start = time.monotonic()
                 move = self.chesscom_interface.get_last_move(verbose=False)
+                self._detect_ms = int((time.monotonic() - t_detect_start) * 1000)
                 if move:
                     self.move_list += move + " "
-                    _bg_print(f"[+] {move}")
                 # If the engine is running, ask it for the reply.
                 if self.engine_manager.process is not None:
                     self._trigger_engine_move()
@@ -280,6 +307,31 @@ class VariantsClient:
 
             # Deduplicate: ignore if we've already handled game-over for this game.
             if game_number == self.game_over_handled_for:
+                return
+
+            # Block during the new-game setup window.
+            # check_for_game_start() sets this False as soon as a new game
+            # number is confirmed and True only after setup_game_over_observer()
+            # completes (clearing window.__gameOverResult and reinstalling the
+            # observer).  Without this guard, stale DOM / cached results from
+            # the previous game can trigger a false game-over for the new one.
+            if not self._new_game_settled:
+                return
+
+            # Enforce a minimum game age before accepting any game-over signal.
+            #
+            # The MutationObserver from the previous game can fire on DOM
+            # mutations that carry stale result text and write a console log.
+            # That log is buffered in the monitor queue and may be read in the
+            # next iteration AFTER _new_game_settled is already True, bypassing
+            # the flag above.  Stale events always arrive within a few hundred
+            # milliseconds of game start; real games virtually never end that
+            # quickly.  Any legitimate near-instant game-over that falls inside
+            # this window is still caught by the fallback DOM scan, which uses
+            # tighter selectors (large modal dialogs only) and fires 2 s after
+            # game detection — well after this window expires.
+            _MIN_GAME_AGE = 3.0  # seconds
+            if time.monotonic() - self._game_start_time < _MIN_GAME_AGE:
                 return
 
             # Run full detection to get details
@@ -331,6 +383,9 @@ class VariantsClient:
                     # Normal path: no new game detected during the sleep.
                     self.current_game_number = None
                     self.was_in_game = False
+                    # Force the promo-banner check to fire on the very next
+                    # monitor cycle rather than waiting up to 3 more seconds.
+                    self._last_promo_check = 0.0
                 # else: a new game is already running — leave state intact.
 
         except Exception as e:
@@ -377,6 +432,13 @@ class VariantsClient:
                 if new_number == self.last_game_number:
                     return
 
+                # Raise the gate BEFORE assigning the new game number.
+                # handle_game_over() is a no-op while False, so stale DOM /
+                # cached __gameOverResult from the previous game cannot be
+                # misread as an immediate loss for the new game during the
+                # window between game-number assignment and observer reset.
+                self._new_game_settled = False
+
                 _bg_print("=" * 60)
                 _bg_print("[Game State] 🎮 GAME STARTED!")
                 _bg_print(f"[Game State] Game #{new_number}")
@@ -394,6 +456,10 @@ class VariantsClient:
                 # cannot fire during the page transition (stale elements from
                 # the previous game may still be in the DOM for a few seconds).
                 self._last_game_over_poll = time.monotonic()
+                # Discard any stale board-orientation/size cache from the
+                # previous game so the first move of the new game re-detects
+                # them correctly.
+                self.chesscom_interface.invalidate_board_params_cache()
 
                 # If an engine is configured, start a fresh process for this game.
                 if self.engine_manager.is_configured:
@@ -437,6 +503,12 @@ class VariantsClient:
                     _bg_print("[Game State] ✓ Move observer re-initialised")
                 else:
                     _bg_print("[Game State] ⚠ Could not re-initialise move observer")
+
+                # Setup is complete: the game-over observer is live and its
+                # stale-result cache has been cleared.  Re-enable game-over
+                # detection for this game.
+                self._new_game_settled = True
+                self._game_start_time = time.monotonic()
 
         except Exception as e:
             # Silently handle errors
@@ -678,7 +750,6 @@ class VariantsClient:
 
                 # Store the move before executing it
                 self.move_list += user_input + " "
-                print(f"[+] {user_input}")
 
                 # Make the move on chess.com
                 success = self.chesscom_interface.make_move(user_input)
@@ -699,6 +770,84 @@ class VariantsClient:
                 print(f"[Error] {e}")
                 print()
 
+    # ── Promo banner recovery ────────────────────────────────────────────────
+
+    def _check_for_promo_banner(self):
+        """Detect a chess.com membership promotion page or overlay.
+
+        chess.com sometimes navigates the user to a full membership/premium
+        page (e.g. chess.com/membership) rather than showing the variants
+        lobby after a game.  It may also display an overlay banner on top of
+        the variants page.  Either form is detected here.
+
+        When detected, we navigate directly back to the variants lobby and,
+        if an automated loop is running, signal it to restart the challenge
+        phase immediately.
+        """
+        try:
+            driver = self.chesscom_interface.driver
+
+            # ── Primary: URL-based detection ─────────────────────────────────
+            # A full-page navigation to the membership/premium URL is the most
+            # common form and is trivially reliable to detect.
+            current_url = driver.current_url
+            BAD_URL_FRAGMENTS = ('/membership', '/premium', '/upgrade',
+                                 '/subscription', '/pricing')
+            is_promo = any(frag in current_url for frag in BAD_URL_FRAGMENTS)
+
+            # ── Secondary: DOM overlay scan ───────────────────────────────────
+            # Catches banners that appear on top of the variants page without
+            # a URL change (less common but possible).
+            if not is_promo:
+                is_promo = driver.execute_script("""
+                    const PROMO_RE = /upgrade|membership|chess\\.com premium|get premium|try premium|subscribe/i;
+                    // Class-name selectors commonly used by chess.com promo overlays.
+                    const selectors = [
+                        '[class*="upgrade"]',
+                        '[class*="membership"]',
+                        '[class*="premium-banner"]',
+                        '[class*="upsell"]',
+                        '[class*="subscription"]',
+                    ];
+                    for (const sel of selectors) {
+                        for (const el of document.querySelectorAll(sel)) {
+                            const rect = el.getBoundingClientRect();
+                            // Must be large enough to be a real full-screen overlay.
+                            if (rect.width < 450 || rect.height < 350) continue;
+                            const style = getComputedStyle(el);
+                            if (style.display === 'none' ||
+                                style.visibility === 'hidden' ||
+                                parseFloat(style.opacity) < 0.1) continue;
+                            if (PROMO_RE.test(el.textContent || '')) return true;
+                        }
+                    }
+                    // Also scan large fixed-position overlays with promo text.
+                    for (const el of document.querySelectorAll(
+                            '[style*="position: fixed"], [style*="position:fixed"]')) {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width < 450 || rect.height < 350) continue;
+                        if (PROMO_RE.test(el.textContent || '')) return true;
+                    }
+                    return false;
+                """) or False
+
+            if is_promo:
+                _bg_print(f"[Client] ⚠ Membership promotion page detected "
+                          f"({current_url}) — navigating back to variants lobby...")
+                driver.get("https://www.chess.com/variants")
+                time.sleep(2.5)
+                # Re-install observers for the freshly loaded lobby page.
+                self.chesscom_interface.setup_game_over_observer()
+                self.chesscom_interface.setup_move_observer()
+                _bg_print("[Client] ✓ Returned to variants lobby")
+
+                if self.loop_running:
+                    self._loop_restart_required = True
+                    _bg_print("[Loop] Signalling loop to restart challenge phase...")
+
+        except Exception:
+            pass
+
     # ── Engine integration ───────────────────────────────────────────────────
 
     def _trigger_engine_move(self):
@@ -712,8 +861,10 @@ class VariantsClient:
         # and the stale callback will discard its result instead of making a
         # move on the wrong (or already-finished) game.
         generation = self._game_generation
+        # Freeze detection time at the point of triggering.
+        detect_ms = self._detect_ms
 
-        def on_best_move(uci_move):
+        def on_best_move(uci_move, think_ms=0, relay_ms=0):
             if not uci_move:
                 return
             if self._game_generation != generation:
@@ -722,9 +873,18 @@ class VariantsClient:
                 return
             self.move_list += uci_move + " "
             _bg_print(f"[Engine] Playing: {uci_move}")
+            t_exec_start = time.monotonic()
             success = self.chesscom_interface.make_move(uci_move)
+            exec_ms = int((time.monotonic() - t_exec_start) * 1000)
             if not success:
                 _bg_print(f"[Engine] ✗ Failed to execute move: {uci_move}")
+            total_ms = detect_ms + think_ms + exec_ms
+            overhead_ms = total_ms - think_ms
+            _bg_print(
+                f"[Timing] detect={detect_ms}ms | "
+                f"engine={think_ms}ms | exec={exec_ms}ms | "
+                f"total={total_ms}ms (overhead={overhead_ms}ms)"
+            )
 
         self.engine_manager.request_move(self.move_list, on_best_move)
 
@@ -754,13 +914,13 @@ class VariantsClient:
         print("[Loop] Stop signal sent — will halt after the current step.")
 
     def _loop_body(self, variants):
-        """Background thread: challenge → wait → play → rematch → repeat.
+        """Background thread: challenge → wait → play → lobby → repeat.
 
         'loop stop' behaviour:
           - In lobby / challenge phase: pending challenges are cancelled
             immediately and the loop exits.
           - In game: the current game is allowed to finish naturally; once it
-            ends the loop exits without attempting a rematch.
+            ends the loop exits and returns to the lobby.
         """
         _bg_print(f"[Loop] Starting loop for: {', '.join(variants)}")
 
@@ -815,6 +975,14 @@ class VariantsClient:
                         _bg_print("[Loop] Stop requested — cancelling pending challenges...")
                         self.chesscom_interface.cancel_challenge()
                         break
+                    if self._loop_restart_required:
+                        # Promo banner navigated us away; cancel stale challenges
+                        # and restart the challenge phase immediately.
+                        _bg_print("[Loop] Promo banner recovery — "
+                                  "restarting challenge phase...")
+                        self._loop_restart_required = False
+                        self.chesscom_interface.cancel_challenge()
+                        break
                     cur = self.current_game_number
                     if cur is not None and cur != prev_game_num:
                         game_accepted = True
@@ -830,7 +998,7 @@ class VariantsClient:
                 if not game_accepted or not self.loop_running:
                     continue  # outer while will exit if loop_running=False
 
-            # ── GAME + REMATCH INNER LOOP ─────────────────────────────────────
+            # ── GAME INNER LOOP ───────────────────────────────────────────────
             # Once a game is in progress the inner loop runs to completion
             # regardless of loop_running — the game is never abandoned
             # mid-play. The loop_running flag is only checked *between* games.
@@ -852,80 +1020,40 @@ class VariantsClient:
                 # ── Wait for game-over (always, even if stop was requested) ───
                 # handle_game_over() sets game_over_handled_for first, then
                 # dismisses the dialog, waits 2 s, and only then clears
-                # current_game_number.  We must also handle the race where the
-                # opponent accepted a rematch so fast that check_for_game_start()
-                # already detected the new game during handle_game_over()'s sleep
-                # — in that case current_game_number will be the *new* game number
-                # (not None) by the time we reach here.
-                rematch_already_accepted = False
+                # current_game_number.
                 while True:
+                    if self._loop_restart_required:
+                        # Promo banner appeared (possibly blocking game-over UI).
+                        break
                     if self.game_over_handled_for == game_num:
-                        cur = self.current_game_number
-                        if cur is None:
-                            # Normal path: game over fully processed.
-                            break
-                        if cur != game_num:
-                            # New game detected during handle_game_over()'s sleep;
-                            # skip the rematch button — game is already running.
-                            rematch_already_accepted = True
+                        if self.current_game_number is None:
+                            # Game over fully processed.
                             break
                     time.sleep(0.5)
 
-                if rematch_already_accepted:
-                    _bg_print(f"[Loop] Rematch pre-accepted — "
-                              f"Game #{self.current_game_number}")
-                    continue  # Stay in inner loop for the new game
-
-                # Extra pause so the Rematch button is fully rendered.
-                time.sleep(1.0)
+                # Promo banner recovery.
+                if self._loop_restart_required:
+                    self._loop_restart_required = False
+                    _bg_print("[Loop] Promo banner recovery — "
+                              "restarting challenge phase...")
+                    break  # Break inner game loop; outer loop will re-challenge
 
                 # Game finished — honour a pending stop request now.
                 if not self.loop_running:
-                    _bg_print("[Loop] Game over — loop stopped (no rematch).")
+                    _bg_print("[Loop] Game over — loop stopped.")
                     break
 
-                # ── Rematch window (15 seconds) ───────────────────────────────
-                _bg_print("[Loop] Game over — requesting rematch "
-                          "(15-second window)...")
-                rematch_sent = self.chesscom_interface.rematch()
-
-                if not rematch_sent:
-                    # Button not found — opponent likely already left.
-                    _bg_print("[Loop] Rematch button not found — "
-                              "going to lobby...")
-                    self.chesscom_interface.exit_to_lobby()
-                    time.sleep(2.0)
+                # Go directly to lobby for next round of challenges.
+                _bg_print("[Loop] Game over — going to lobby...")
+                exit_ok = self.chesscom_interface.exit_to_lobby()
+                if not exit_ok:
+                    # Exit button missing: likely on the promo page.
+                    self._check_for_promo_banner()
+                if self._loop_restart_required:
+                    self._loop_restart_required = False
+                    _bg_print("[Loop] Promo banner recovery — "
+                              "restarting challenge phase...")
                     break
-
-                deadline = time.time() + 15
-                rematch_accepted = False
-
-                while self.loop_running:
-                    cur = self.current_game_number
-                    if cur is not None and cur != game_num:
-                        rematch_accepted = True
-                        break
-                    if time.time() > deadline:
-                        break
-                    time.sleep(0.5)
-
-                if rematch_accepted:
-                    _bg_print(f"[Loop] Rematch accepted — "
-                              f"Game #{self.current_game_number}")
-                    continue  # Stay in inner loop for the new game
-
-                # Rematch not accepted (timeout or stop requested).
-                if not self.loop_running:
-                    # Stop was requested during the rematch window.
-                    _bg_print("[Loop] Stop requested — cancelling rematch...")
-                    self.chesscom_interface.rematch()  # second click cancels
-                    time.sleep(0.5)
-                    break
-
-                # Normal timeout: go directly to lobby for next challenge.
-                # Opponent may have already left; don't attempt a cancel click.
-                _bg_print("[Loop] Rematch not accepted — going to lobby...")
-                self.chesscom_interface.exit_to_lobby()
                 time.sleep(2.0)
                 break  # Back to outer challenge loop
 

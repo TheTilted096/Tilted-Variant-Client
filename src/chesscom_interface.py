@@ -19,6 +19,13 @@ class ChessComInterface:
         """
         self.driver = driver
         self.wait = WebDriverWait(driver, 10)
+        # Cached board parameters (is_flipped, board_size) shared between
+        # get_last_move() and make_move_cdp().  Board orientation and size
+        # are stable for the entire game; recomputing them on every move
+        # wastes 2-3 execute_script round-trips (~80-120 ms).  The cache is
+        # invalidated externally when a new game starts.
+        self._board_params_cache = None   # (is_flipped: bool, board_size: dict)
+        self._board_params_time  = 0.0    # monotonic timestamp of last refresh
 
     def focus_browser(self):
         """Bring the browser window to focus."""
@@ -31,6 +38,145 @@ class ChessComInterface:
             time.sleep(0.3)
         except Exception as e:
             print(f"[ChessCom] Warning: Could not focus browser: {e}")
+
+    # ── Board-parameter cache ─────────────────────────────────────────────────
+
+    def _get_cached_board_params(self, max_age=60.0):
+        """Return (is_flipped, board_size, board_rect), refreshing at most every max_age seconds.
+
+        Board orientation, dimensions, and on-screen position are constant
+        within a game; recomputing them on every move wastes execute_script
+        round-trips (~80-120 ms each, and much worse when the tab is occluded
+        and Chrome throttles JS execution).  The cache is invalidated
+        externally when a new game starts.
+
+        board_rect is {'left': float, 'top': float, 'width': float} and is
+        extracted at no extra cost from the debug info already returned by
+        get_board_orientation().  Callers can use _coords_for_square_py()
+        to compute pixel coordinates in pure Python with zero execute_script
+        calls.  board_rect may be None if the board element was not found.
+        """
+        now = time.monotonic()
+        if self._board_params_cache and (now - self._board_params_time < max_age):
+            return self._board_params_cache
+        # get_board_orientation() already calls getBoundingClientRect() and
+        # stores the result in debug.boardInfo — extract it for free rather
+        # than running a separate script just to get the board rect.
+        orientation = self.get_board_orientation()
+        is_flipped  = orientation['is_flipped']
+        board_info  = orientation.get('debug', {}).get('boardInfo') or {}
+        board_rect  = (
+            {'left': board_info['left'], 'top': board_info['top'],
+             'width': board_info['width']}
+            if board_info.get('width')
+            else None
+        )
+        board_size  = self.detect_board_size()
+        self._board_params_cache = (is_flipped, board_size, board_rect)
+        self._board_params_time  = now
+        return self._board_params_cache
+
+    def invalidate_board_params_cache(self):
+        """Discard cached board parameters (call when a new game starts)."""
+        self._board_params_cache = None
+        self._board_params_time  = 0.0
+
+    def _coords_for_square_py(self, square, is_flipped, board_size, board_rect):
+        """Return {'x': float, 'y': float} for square using pure Python arithmetic.
+
+        This is the execute_script-free fast path for coordinate lookup.
+        Requires board_rect from the cache (populated by _get_cached_board_params).
+        The math mirrors what get_two_square_coordinates() does in JS.
+        """
+        file_letter  = square[0].lower()
+        rank_number  = int(square[1:])
+        file_num     = ord(file_letter) - ord('a') + 1
+        num_files    = board_size.get('files', 8)
+        num_ranks    = board_size.get('ranks', 8)
+        sq_size      = board_rect['width'] / num_files
+        if is_flipped:
+            fi = num_files - file_num
+            ri = rank_number - 1
+        else:
+            fi = file_num - 1
+            ri = num_ranks - rank_number
+        return {
+            'x': board_rect['left'] + fi * sq_size + sq_size / 2,
+            'y': board_rect['top']  + ri * sq_size + sq_size / 2,
+        }
+
+
+    # ── Dual-square coordinate lookup ────────────────────────────────────────
+
+    def get_two_square_coordinates(self, from_square, to_square, is_flipped, board_size):
+        """Return pixel centres for two squares in a single execute_script call.
+
+        Replacing two separate get_square_coordinates() calls (2 round-trips)
+        with this method halves the number of execute_script calls needed for
+        a move, saving ~40 ms per move.
+
+        Returns:
+            (from_coords, to_coords) where each is a dict with 'x' and 'y',
+            or (None, None) on failure.
+        """
+        num_files = board_size.get('files', 8)
+        num_ranks = board_size.get('ranks', 8)
+
+        def _parse(sq):
+            """Split algebraic square into (file_num, rank_number)."""
+            if not sq or len(sq) < 2:
+                return None, None
+            file_letter = sq[0].lower()
+            rank_str    = sq[1:]
+            try:
+                file_num     = ord(file_letter) - ord('a') + 1
+                rank_number  = int(rank_str)
+                return file_num, rank_number
+            except ValueError:
+                return None, None
+
+        ff, fr = _parse(from_square)
+        tf, tr = _parse(to_square)
+        if ff is None or tf is None:
+            return None, None
+
+        js = f"""
+        const board = document.querySelector('.TheBoard-squares') ||
+                     document.querySelector('[class*="Board-squares"]') ||
+                     document.querySelector('.board') ||
+                     document.querySelector('[class*="board"]');
+        if (!board) return null;
+        const rect      = board.getBoundingClientRect();
+        const numFiles  = {num_files};
+        const numRanks  = {num_ranks};
+        const sqSize    = rect.width / numFiles;
+        const isFlipped = {str(is_flipped).lower()};
+
+        const coords = function(fileNum, rankNumber) {{
+            let fi, ri;
+            if (isFlipped) {{
+                fi = numFiles - fileNum;
+                ri = rankNumber - 1;
+            }} else {{
+                fi = fileNum - 1;
+                ri = numRanks - rankNumber;
+            }}
+            return {{
+                x: rect.left + fi * sqSize + sqSize / 2,
+                y: rect.top  + ri * sqSize + sqSize / 2
+            }};
+        }};
+        return [coords({ff}, {fr}), coords({tf}, {tr})];
+        """
+        try:
+            result = self.driver.execute_script(js)
+            if result and len(result) == 2:
+                return result[0], result[1]
+        except Exception:
+            pass
+        return None, None
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     def detect_board_size(self):
         """
@@ -841,57 +987,83 @@ class ChessComInterface:
 
             print(f"[ChessCom] Move: {from_square} → {to_square}")
 
-            # Detect board orientation and size once (cache for this move)
-            is_flipped = self.is_board_flipped()
-            board_size = self.detect_board_size()
+            # Board geometry is stable for an entire game.  The cache is
+            # filled with one execute_script on the first move (TTL 60 s,
+            # explicit invalidation between games) and reused at zero cost
+            # for every subsequent move — critical when the tab is occluded
+            # and Chrome throttles JS execution to several seconds per call.
+            is_flipped, board_size, board_rect = self._get_cached_board_params()
 
-            # Get coordinates for both squares (pass cached flip state and board size)
-            from_coords = self.get_square_coordinates(from_square, is_flipped, board_size)
-            to_coords = self.get_square_coordinates(to_square, is_flipped, board_size)
+            # Compute square centres in pure Python from the cached board
+            # rect.  This replaces the per-move execute_script in
+            # get_two_square_coordinates() with simple arithmetic, so the
+            # hot path after the first move contains zero execute_script
+            # calls and is completely immune to Chrome's occlusion throttling.
+            if board_rect:
+                from_coords = self._coords_for_square_py(
+                    from_square, is_flipped, board_size, board_rect)
+                to_coords   = self._coords_for_square_py(
+                    to_square,   is_flipped, board_size, board_rect)
+            else:
+                # Fallback: board element not found in cache; use the JS path.
+                from_coords, to_coords = self.get_two_square_coordinates(
+                    from_square, to_square, is_flipped, board_size
+                )
 
             if not from_coords or not to_coords:
                 print(f"[ChessCom] ✗ Could not find board squares")
                 return False
 
-            # Use CDP Input.dispatchMouseEvent (same as Puppeteer's page.mouse)
+            # Use CDP Input.dispatchMouseEvent for a click-click move.
+            #
+            # Why click-click instead of drag:
+            #   • Drag suppresses chess.com's CSS piece animation; the site
+            #     tracks the cursor position directly, so any synthetic drag
+            #     (whether 1 step or 100) looks choppy because we control
+            #     the visual, not the CSS engine.
+            #   • Click-click (select piece → click destination) lets chess.com
+            #     handle the animation itself via CSS transitions at native
+            #     60 fps — exactly the same smooth motion as a human clicking.
+            #   • It also eliminates the execute_script call that caused
+            #     background-tab JS throttling (5 s overhead when minimised).
+            #     All five events below go through the CDP input pipeline,
+            #     which is not subject to background-tab throttling.
             try:
-                # Move to source position
+                x_from, y_from = from_coords['x'], from_coords['y']
+                x_to,   y_to   = to_coords['x'],   to_coords['y']
+
+                # Move cursor to the source square.
                 self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
                     'type': 'mouseMoved',
-                    'x': from_coords['x'],
-                    'y': from_coords['y']
+                    'x': x_from, 'y': y_from
                 })
-                time.sleep(0.01)
 
-                # Mouse down
+                # Click source square → piece becomes selected.
                 self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
                     'type': 'mousePressed',
-                    'x': from_coords['x'],
-                    'y': from_coords['y'],
-                    'button': 'left',
-                    'clickCount': 1
+                    'x': x_from, 'y': y_from,
+                    'button': 'left', 'clickCount': 1
                 })
-                time.sleep(0.02)
-
-                # Drag to destination with steps (like Puppeteer's steps: 3)
-                steps = 3
-                for i in range(1, steps + 1):
-                    x = from_coords['x'] + (to_coords['x'] - from_coords['x']) * i / steps
-                    y = from_coords['y'] + (to_coords['y'] - from_coords['y']) * i / steps
-                    self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                        'type': 'mouseMoved',
-                        'x': x,
-                        'y': y,
-                        'button': 'left'
-                    })
-
-                # Mouse up at destination
+                time.sleep(0.015)
                 self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
                     'type': 'mouseReleased',
-                    'x': to_coords['x'],
-                    'y': to_coords['y'],
-                    'button': 'left',
-                    'clickCount': 1
+                    'x': x_from, 'y': y_from,
+                    'button': 'left', 'clickCount': 1
+                })
+                time.sleep(0.05)   # let piece-selection state register
+
+                # Click destination square → piece placed; chess.com fires
+                # its CSS transition animation from here.
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mousePressed',
+                    'x': x_to, 'y': y_to,
+                    'button': 'left', 'clickCount': 1
+                })
+                time.sleep(0.015)
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseReleased',
+                    'x': x_to, 'y': y_to,
+                    'button': 'left', 'clickCount': 1
                 })
 
             except Exception as cdp_error:
@@ -3487,8 +3659,9 @@ class ChessComInterface:
         Returns:
             str: UCI move string, or None if the move could not be determined.
         """
-        board_size   = self.detect_board_size()
-        is_flipped   = self.is_board_flipped()
+        # Use shared cache so the board-param round-trips already paid by the
+        # monitor cycle (or by make_move_cdp) are not repeated here.
+        is_flipped, board_size, _board_rect = self._get_cached_board_params()
         variant_name = self.get_variant_name()
         num_files = board_size.get('files', 8)
         num_ranks = board_size.get('ranks', 8)

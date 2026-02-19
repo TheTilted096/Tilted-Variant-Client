@@ -72,7 +72,16 @@ class BrowserLauncher:
             "--no-default-browser-check",
             "--new-window",  # Open in standalone window
             "--start-maximized",
-            "--app=https://www.chess.com/variants"  # App mode for cleaner standalone window
+            "--app=https://www.chess.com/variants",  # App mode for cleaner standalone window
+            # ── Background operation flags ────────────────────────────────────
+            # Prevent the renderer from being throttled or paused when the
+            # browser window is not in focus or is behind another full-screen
+            # app.  Without these flags chess.com detects the hidden state and
+            # stops responding to synthetic mouse events.
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-background-media-suspend",
         ]
 
         try:
