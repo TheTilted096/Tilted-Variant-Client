@@ -984,67 +984,56 @@ class ChessComInterface:
                 print(f"[ChessCom] ✗ Could not find board squares")
                 return False
 
-            # Use CDP Input.dispatchMouseEvent (same as Puppeteer's page.mouse)
+            # Use CDP Input.dispatchMouseEvent for a click-click move.
+            #
+            # Why click-click instead of drag:
+            #   • Drag suppresses chess.com's CSS piece animation; the site
+            #     tracks the cursor position directly, so any synthetic drag
+            #     (whether 1 step or 100) looks choppy because we control
+            #     the visual, not the CSS engine.
+            #   • Click-click (select piece → click destination) lets chess.com
+            #     handle the animation itself via CSS transitions at native
+            #     60 fps — exactly the same smooth motion as a human clicking.
+            #   • It also eliminates the execute_script call that caused
+            #     background-tab JS throttling (5 s overhead when minimised).
+            #     All five events below go through the CDP input pipeline,
+            #     which is not subject to background-tab throttling.
             try:
-                # Move to source position
+                x_from, y_from = from_coords['x'], from_coords['y']
+                x_to,   y_to   = to_coords['x'],   to_coords['y']
+
+                # Move cursor to the source square.
                 self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
                     'type': 'mouseMoved',
-                    'x': from_coords['x'],
-                    'y': from_coords['y']
+                    'x': x_from, 'y': y_from
                 })
-                time.sleep(0.01)
 
-                # Mouse down
+                # Click source square → piece becomes selected.
                 self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
                     'type': 'mousePressed',
-                    'x': from_coords['x'],
-                    'y': from_coords['y'],
-                    'button': 'left',
-                    'clickCount': 1
+                    'x': x_from, 'y': y_from,
+                    'button': 'left', 'clickCount': 1
                 })
-                time.sleep(0.02)
-
-                # Smooth 8-frame drag animation dispatched in a SINGLE
-                # execute_script call.  Sending each frame as a separate
-                # execute_cdp_cmd would cost ~40 ms × 8 = ~320 ms; batching
-                # them into one JS round-trip keeps the cost near zero while
-                # giving chess.com's drag listener a convincing sweep path.
-                # Both PointerEvent and MouseEvent are fired for each frame
-                # to match what a real mouse drag produces.
-                from_x = from_coords['x']
-                from_y = from_coords['y']
-                to_x   = to_coords['x']
-                to_y   = to_coords['y']
-                self.driver.execute_script(f"""
-                    const frames = 8;
-                    const fx = {from_x}, fy = {from_y};
-                    const tx = {to_x},   ty = {to_y};
-                    for (let i = 1; i <= frames; i++) {{
-                        const t  = i / (frames + 1);
-                        const x  = fx + (tx - fx) * t;
-                        const y  = fy + (ty - fy) * t;
-                        const el = document.elementFromPoint(x, y) || document.body;
-                        el.dispatchEvent(new PointerEvent('pointermove', {{
-                            bubbles: true, cancelable: true,
-                            clientX: x, clientY: y, screenX: x, screenY: y,
-                            pointerId: 1, pointerType: 'mouse', isPrimary: true,
-                            button: -1, buttons: 1
-                        }}));
-                        el.dispatchEvent(new MouseEvent('mousemove', {{
-                            bubbles: true, cancelable: true,
-                            clientX: x, clientY: y, screenX: x, screenY: y,
-                            button: 0, buttons: 1
-                        }}));
-                    }}
-                """)
-
-                # Mouse up at destination
+                time.sleep(0.015)
                 self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
                     'type': 'mouseReleased',
-                    'x': to_coords['x'],
-                    'y': to_coords['y'],
-                    'button': 'left',
-                    'clickCount': 1
+                    'x': x_from, 'y': y_from,
+                    'button': 'left', 'clickCount': 1
+                })
+                time.sleep(0.05)   # let piece-selection state register
+
+                # Click destination square → piece placed; chess.com fires
+                # its CSS transition animation from here.
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mousePressed',
+                    'x': x_to, 'y': y_to,
+                    'button': 'left', 'clickCount': 1
+                })
+                time.sleep(0.015)
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseReleased',
+                    'x': x_to, 'y': y_to,
+                    'button': 'left', 'clickCount': 1
                 })
 
             except Exception as cdp_error:
