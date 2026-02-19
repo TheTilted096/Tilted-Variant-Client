@@ -413,6 +413,13 @@ class VariantsClient:
                 # cannot fire during the page transition (stale elements from
                 # the previous game may still be in the DOM for a few seconds).
                 self._last_game_over_poll = time.monotonic()
+                # Discard any stale board-orientation/size cache from the
+                # previous game so the first move of the new game re-detects
+                # them correctly.
+                self.chesscom_interface.invalidate_board_params_cache()
+                # Override the Page Visibility API so chess.com keeps running
+                # when the user moves another window in front of the browser.
+                self.chesscom_interface.inject_background_fix()
 
                 # If an engine is configured, start a fresh process for this game.
                 if self.engine_manager.is_configured:
@@ -825,10 +832,10 @@ class VariantsClient:
             exec_ms = int((time.monotonic() - t_exec_start) * 1000)
             if not success:
                 _bg_print(f"[Engine] ✗ Failed to execute move: {uci_move}")
-            total_ms = detect_ms + relay_ms + think_ms + exec_ms
+            total_ms = detect_ms + think_ms + exec_ms
             overhead_ms = total_ms - think_ms
             _bg_print(
-                f"[Timing] detect={detect_ms}ms | relay={relay_ms}ms | "
+                f"[Timing] detect={detect_ms}ms | "
                 f"engine={think_ms}ms | exec={exec_ms}ms | "
                 f"total={total_ms}ms (overhead={overhead_ms}ms)"
             )
