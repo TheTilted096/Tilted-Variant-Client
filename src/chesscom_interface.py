@@ -105,30 +105,6 @@ class ChessComInterface:
             'y': board_rect['top']  + ri * sq_size + sq_size / 2,
         }
 
-    def inject_background_fix(self):
-        """Override Page Visibility API so chess.com stays active when the
-        browser window is not in focus or is behind another full-screen app.
-
-        chess.com pauses interactions when it sees document.hidden == true
-        or document.hasFocus() == false.  Overriding these getters keeps the
-        game running while the user has other windows open.
-        """
-        try:
-            self.driver.execute_script("""
-                if (window.__bgFixInjected) return;
-                window.__bgFixInjected = true;
-                try {
-                    Object.defineProperty(document, 'hidden',
-                        {get: () => false, configurable: true});
-                    Object.defineProperty(document, 'visibilityState',
-                        {get: () => 'visible', configurable: true});
-                    document.hasFocus = () => true;
-                    // Suppress blur events that tell the page it lost focus.
-                    window.addEventListener('blur', e => e.stopImmediatePropagation(), true);
-                } catch(e) {}
-            """)
-        except Exception:
-            pass
 
     # ── Dual-square coordinate lookup ────────────────────────────────────────
 

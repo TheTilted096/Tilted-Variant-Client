@@ -440,9 +440,6 @@ class VariantsClient:
                 # previous game so the first move of the new game re-detects
                 # them correctly.
                 self.chesscom_interface.invalidate_board_params_cache()
-                # Override the Page Visibility API so chess.com keeps running
-                # when the user moves another window in front of the browser.
-                self.chesscom_interface.inject_background_fix()
 
                 # If an engine is configured, start a fresh process for this game.
                 if self.engine_manager.is_configured:
