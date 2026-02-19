@@ -123,34 +123,32 @@ class ChessComInterface:
             return None, None
 
         js = f"""
-        (function() {{
-            const board = document.querySelector('.TheBoard-squares') ||
-                         document.querySelector('[class*="Board-squares"]') ||
-                         document.querySelector('.board') ||
-                         document.querySelector('[class*="board"]');
-            if (!board) return null;
-            const rect      = board.getBoundingClientRect();
-            const numFiles  = {num_files};
-            const numRanks  = {num_ranks};
-            const sqSize    = rect.width / numFiles;
-            const isFlipped = {str(is_flipped).lower()};
+        const board = document.querySelector('.TheBoard-squares') ||
+                     document.querySelector('[class*="Board-squares"]') ||
+                     document.querySelector('.board') ||
+                     document.querySelector('[class*="board"]');
+        if (!board) return null;
+        const rect      = board.getBoundingClientRect();
+        const numFiles  = {num_files};
+        const numRanks  = {num_ranks};
+        const sqSize    = rect.width / numFiles;
+        const isFlipped = {str(is_flipped).lower()};
 
-            function coords(fileNum, rankNumber) {{
-                let fi, ri;
-                if (isFlipped) {{
-                    fi = numFiles - fileNum;
-                    ri = rankNumber - 1;
-                }} else {{
-                    fi = fileNum - 1;
-                    ri = numRanks - rankNumber;
-                }}
-                return {{
-                    x: rect.left + fi * sqSize + sqSize / 2,
-                    y: rect.top  + ri * sqSize + sqSize / 2
-                }};
+        const coords = function(fileNum, rankNumber) {{
+            let fi, ri;
+            if (isFlipped) {{
+                fi = numFiles - fileNum;
+                ri = rankNumber - 1;
+            }} else {{
+                fi = fileNum - 1;
+                ri = numRanks - rankNumber;
             }}
-            return [coords({ff}, {fr}), coords({tf}, {tr})];
-        }})()
+            return {{
+                x: rect.left + fi * sqSize + sqSize / 2,
+                y: rect.top  + ri * sqSize + sqSize / 2
+            }};
+        }};
+        return [coords({ff}, {fr}), coords({tf}, {tr})];
         """
         try:
             result = self.driver.execute_script(js)
