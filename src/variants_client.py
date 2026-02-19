@@ -347,6 +347,9 @@ class VariantsClient:
                     # Normal path: no new game detected during the sleep.
                     self.current_game_number = None
                     self.was_in_game = False
+                    # Force the promo-banner check to fire on the very next
+                    # monitor cycle rather than waiting up to 3 more seconds.
+                    self._last_promo_check = 0.0
                 # else: a new game is already running — leave state intact.
 
         except Exception as e:
@@ -717,50 +720,68 @@ class VariantsClient:
     # ── Promo banner recovery ────────────────────────────────────────────────
 
     def _check_for_promo_banner(self):
-        """Detect a full-screen chess.com membership promotion banner.
+        """Detect a chess.com membership promotion page or overlay.
 
-        These banners appear between games and effectively eject the user from
-        the variants server.  When detected, we navigate directly back to the
-        variants lobby and, if an automated loop is running, signal it to
-        restart the challenge phase.
+        chess.com sometimes navigates the user to a full membership/premium
+        page (e.g. chess.com/membership) rather than showing the variants
+        lobby after a game.  It may also display an overlay banner on top of
+        the variants page.  Either form is detected here.
+
+        When detected, we navigate directly back to the variants lobby and,
+        if an automated loop is running, signal it to restart the challenge
+        phase immediately.
         """
         try:
-            is_promo = self.chesscom_interface.driver.execute_script("""
-                const PROMO_RE = /upgrade|membership|chess\\.com premium|get premium|try premium|subscribe/i;
-                // Class-name selectors commonly used by chess.com promo overlays.
-                const selectors = [
-                    '[class*="upgrade"]',
-                    '[class*="membership"]',
-                    '[class*="premium-banner"]',
-                    '[class*="upsell"]',
-                    '[class*="subscription"]',
-                ];
-                for (const sel of selectors) {
-                    for (const el of document.querySelectorAll(sel)) {
+            driver = self.chesscom_interface.driver
+
+            # ── Primary: URL-based detection ─────────────────────────────────
+            # A full-page navigation to the membership/premium URL is the most
+            # common form and is trivially reliable to detect.
+            current_url = driver.current_url
+            BAD_URL_FRAGMENTS = ('/membership', '/premium', '/upgrade',
+                                 '/subscription', '/pricing')
+            is_promo = any(frag in current_url for frag in BAD_URL_FRAGMENTS)
+
+            # ── Secondary: DOM overlay scan ───────────────────────────────────
+            # Catches banners that appear on top of the variants page without
+            # a URL change (less common but possible).
+            if not is_promo:
+                is_promo = driver.execute_script("""
+                    const PROMO_RE = /upgrade|membership|chess\\.com premium|get premium|try premium|subscribe/i;
+                    // Class-name selectors commonly used by chess.com promo overlays.
+                    const selectors = [
+                        '[class*="upgrade"]',
+                        '[class*="membership"]',
+                        '[class*="premium-banner"]',
+                        '[class*="upsell"]',
+                        '[class*="subscription"]',
+                    ];
+                    for (const sel of selectors) {
+                        for (const el of document.querySelectorAll(sel)) {
+                            const rect = el.getBoundingClientRect();
+                            // Must be large enough to be a real full-screen overlay.
+                            if (rect.width < 450 || rect.height < 350) continue;
+                            const style = getComputedStyle(el);
+                            if (style.display === 'none' ||
+                                style.visibility === 'hidden' ||
+                                parseFloat(style.opacity) < 0.1) continue;
+                            if (PROMO_RE.test(el.textContent || '')) return true;
+                        }
+                    }
+                    // Also scan large fixed-position overlays with promo text.
+                    for (const el of document.querySelectorAll(
+                            '[style*="position: fixed"], [style*="position:fixed"]')) {
                         const rect = el.getBoundingClientRect();
-                        // Must be large enough to be a real full-screen overlay.
                         if (rect.width < 450 || rect.height < 350) continue;
-                        const style = getComputedStyle(el);
-                        if (style.display === 'none' ||
-                            style.visibility === 'hidden' ||
-                            parseFloat(style.opacity) < 0.1) continue;
                         if (PROMO_RE.test(el.textContent || '')) return true;
                     }
-                }
-                // Also scan large fixed-position overlays with promo text.
-                for (const el of document.querySelectorAll(
-                        '[style*="position: fixed"], [style*="position:fixed"]')) {
-                    const rect = el.getBoundingClientRect();
-                    if (rect.width < 450 || rect.height < 350) continue;
-                    if (PROMO_RE.test(el.textContent || '')) return true;
-                }
-                return false;
-            """) or False
+                    return false;
+                """) or False
 
             if is_promo:
-                _bg_print("[Client] ⚠ Membership promotion banner detected — "
-                          "navigating back to variants lobby...")
-                self.chesscom_interface.driver.get("https://www.chess.com/variants")
+                _bg_print(f"[Client] ⚠ Membership promotion page detected "
+                          f"({current_url}) — navigating back to variants lobby...")
+                driver.get("https://www.chess.com/variants")
                 time.sleep(2.5)
                 # Re-install observers for the freshly loaded lobby page.
                 self.chesscom_interface.setup_game_over_observer()
@@ -995,10 +1016,21 @@ class VariantsClient:
                 rematch_sent = self.chesscom_interface.rematch()
 
                 if not rematch_sent:
-                    # Button not found — opponent likely already left.
+                    # Button not found — opponent likely already left, OR the
+                    # page navigated to a promo screen before the button rendered.
                     _bg_print("[Loop] Rematch button not found — "
                               "going to lobby...")
-                    self.chesscom_interface.exit_to_lobby()
+                    exit_ok = self.chesscom_interface.exit_to_lobby()
+                    if not exit_ok:
+                        # Exit button also missing: we're probably on the promo
+                        # page.  Check now rather than waiting for the background
+                        # monitor's next 3-second cycle.
+                        self._check_for_promo_banner()
+                    if self._loop_restart_required:
+                        self._loop_restart_required = False
+                        _bg_print("[Loop] Promo banner recovery — "
+                                  "restarting challenge phase...")
+                        break
                     time.sleep(2.0)
                     break
 
