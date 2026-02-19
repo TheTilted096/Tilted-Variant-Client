@@ -1,10 +1,17 @@
 """Main variants client for chess.com."""
+import os
 import sys
 import time
 import threading
 from browser_launcher import BrowserLauncher
 from chesscom_interface import ChessComInterface
 from uci_handler import UCIHandler
+from engine_manager import EngineManager
+
+# Absolute path to the engines/ directory (one level above src/).
+_ENGINES_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'engines'
+)
 
 
 def _bg_print(msg=''):
@@ -40,6 +47,8 @@ class VariantsClient:
         self.last_state_check = 0
         # Move list storage: space-separated UCI moves for the current game
         self.move_list = ""
+        # Fallback game-over polling (monotonic timestamp of last check)
+        self._last_game_over_poll = 0.0
         # Background monitoring thread
         self.monitor_thread = None
         self.monitor_thread_running = False
@@ -47,6 +56,12 @@ class VariantsClient:
         # Automated variant-loop state
         self.loop_running = False
         self.loop_thread = None
+        # Engine integration
+        self.engine_manager = EngineManager(_ENGINES_DIR)
+        # Monotonically-incrementing counter: bumped every time a new game
+        # starts.  The engine callback captures this value so it can detect
+        # whether the game it was searching for is still the current one.
+        self._game_generation = 0
 
     def start(self):
         """Start the variants client."""
@@ -152,6 +167,32 @@ class VariantsClient:
             if game_over:
                 self.handle_game_over()
 
+            # Fallback: the MutationObserver can miss the game-over dialog
+            # (animation timing, observer disconnected after navigation, class
+            # names not matching selectors, etc.).  Every ~2 s, when we believe
+            # a game is in progress and game-over hasn't been handled yet, run a
+            # direct DOM scan as a safety net.
+            #
+            # IMPORTANT: we do NOT reuse detect_game_over() here because its
+            # selectors are intentionally broad (they include [class*="result"],
+            # [class*="end"], [class*="win"], etc.) — fine for *confirming* an
+            # observer signal but far too broad for standalone *detection*.
+            # Chat messages, rating badges, and sidebar elements from the
+            # previous game would cause false positives.  Instead, we use a
+            # tighter check that only matches actual modal dialog overlays.
+            if (not game_over
+                    and self.was_in_game
+                    and self.current_game_number is not None
+                    and self.game_over_handled_for != self.current_game_number):
+                now = time.monotonic()
+                if now - self._last_game_over_poll >= 2.0:
+                    self._last_game_over_poll = now
+                    dialog_visible = self._is_game_over_dialog_visible()
+                    if dialog_visible:
+                        _bg_print("[Game State] Game over detected via "
+                                  "fallback scan (observer missed it)")
+                        self.handle_game_over()
+
             # Also periodically check for game start
             self.check_for_game_start()
 
@@ -159,6 +200,46 @@ class VariantsClient:
             # Only print non-session errors (session errors are expected on shutdown)
             if 'invalid session' not in str(e).lower():
                 print(f"[Debug] Error in process_console_events: {e}")
+
+    def _is_game_over_dialog_visible(self):
+        """Targeted check for the game-over modal dialog.
+
+        Unlike detect_game_over() — which uses very broad CSS selectors suited
+        to *confirming* an observer event — this method only matches genuine
+        modal overlays (large, visible dialogs with game-over text).  This
+        prevents false positives from chat messages, rating badges, and other
+        page elements that contain stale result text from previous games.
+
+        Returns True if a game-over dialog overlay is currently visible.
+        """
+        try:
+            return self.chesscom_interface.driver.execute_script("""
+                const RE = /you won|you lost|you drew|black won|white won|draw by agreement|checkmate|stalemate|time.?out|flagged|resign|abandon/i;
+
+                // 1. Check explicit modal/dialog/popup elements that are large
+                //    enough to be an overlay (not a small chat badge or tooltip).
+                const selectors = '[class*="modal"], [class*="dialog"], [class*="popup"], [class*="game-over"]';
+                for (const el of document.querySelectorAll(selectors)) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 250 || rect.height < 200) continue;
+                    const style = getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') continue;
+                    if (RE.test(el.textContent || '')) return true;
+                }
+
+                // 2. Check inline-styled fixed-position overlays (some sites
+                //    render modals with inline styles rather than class names).
+                for (const el of document.querySelectorAll(
+                        '[style*="position: fixed"], [style*="position:fixed"]')) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 250 || rect.height < 200) continue;
+                    if (RE.test(el.textContent || '')) return true;
+                }
+
+                return false;
+            """) or False
+        except Exception:
+            return False
 
     def handle_board_changed(self):
         """Handle board change event from MutationObserver.
@@ -180,6 +261,9 @@ class VariantsClient:
                 if move:
                     self.move_list += move + " "
                     _bg_print(f"[+] {move}")
+                # If the engine is running, ask it for the reply.
+                if self.engine_manager.process is not None:
+                    self._trigger_engine_move()
         except Exception:
             pass
 
@@ -223,13 +307,31 @@ class VariantsClient:
                 else:
                     _bg_print("[Game State] ✗ Failed to dismiss dialog")
 
+                # Terminate the engine immediately — this must happen before any
+                # further loop steps (rematch requests, lobby navigation, etc.).
+                # A fresh instance will be started when the next game begins.
+                if self.engine_manager.process is not None:
+                    _bg_print("[Engine] Terminating engine process...")
+                    self.engine_manager.stop()
+                    _bg_print("[Engine] ✓ Engine process terminated")
+
                 # Wait for play/rematch buttons to render after dialog closes.
                 time.sleep(2.0)
 
-                # Reset game state tracking
+                # Reset game state tracking.
+                # Guard: check_for_game_start() may have detected a new game
+                # during the sleep above (e.g. opponent accepted a rematch very
+                # quickly, before we even had a chance to click the button).
+                # In that case current_game_number was already updated to the
+                # new game number and was_in_game set back to True — do NOT
+                # overwrite that state or the new game will be invisible to the
+                # inner loop and challenge logic.
                 self.last_game_number = game_number
-                self.was_in_game = False
-                self.current_game_number = None
+                if self.current_game_number == game_number:
+                    # Normal path: no new game detected during the sleep.
+                    self.current_game_number = None
+                    self.was_in_game = False
+                # else: a new game is already running — leave state intact.
 
         except Exception as e:
             pass
@@ -280,6 +382,7 @@ class VariantsClient:
                 _bg_print(f"[Game State] Game #{new_number}")
                 self.current_game_number = new_number
                 self.last_game_number = None  # Consumed; clear so future games work
+                self._game_generation += 1    # Invalidate any in-flight engine search
                 if start_info.get('method'):
                     _bg_print(f"[Game State] Detected via: {start_info['method']}")
                 if game_state['color']:
@@ -287,10 +390,45 @@ class VariantsClient:
                 _bg_print("=" * 60)
                 self.was_in_game = True
                 self.move_list = ""
+                # Push the fallback game-over poll into the future so it
+                # cannot fire during the page transition (stale elements from
+                # the previous game may still be in the DOM for a few seconds).
+                self._last_game_over_poll = time.monotonic()
 
-                # Reset the game over observer and dedup tracker for the new game
+                # If an engine is configured, start a fresh process for this game.
+                if self.engine_manager.is_configured:
+                    variant = self.chesscom_interface.get_variant_name() or 'chess'
+                    _bg_print(f"[Engine] Starting '{self.engine_manager.active_engine_name}' "
+                              f"for variant: {variant}")
+                    ok = self.engine_manager.start(
+                        variant, game_state.get('color', 'white')
+                    )
+                    if ok:
+                        _bg_print("[Engine] ✓ Engine ready")
+                        # Re-fetch state: the UCI handshake can take several
+                        # hundred milliseconds, during which the opponent may
+                        # have played.  Using the stale game_state from above
+                        # would send "position startpos" (white to move) even
+                        # when the engine is black and a move was missed.
+                        fresh_state = self.chesscom_interface.get_game_state()
+                        if fresh_state.get('color') == fresh_state.get('turn'):
+                            # Harvest any move played while the engine was
+                            # starting so it isn't missing from the move list.
+                            missed = self.chesscom_interface.get_last_move(verbose=False)
+                            if missed:
+                                self.move_list += missed + " "
+                                _bg_print(f"[+] {missed} (caught up)")
+                            self._trigger_engine_move()
+                    else:
+                        _bg_print("[Engine] ✗ Failed to start engine — playing manually")
+
+                # Re-install the game-over observer for the new game.
+                # reset_game_over_observer() only clears flags; the observer
+                # itself may have been destroyed by an SPA page transition, so
+                # we re-run the full setup (which disconnects any stale observer
+                # first) to guarantee it is live for this game.
                 self.game_over_handled_for = None
-                self.chesscom_interface.reset_game_over_observer()
+                self.chesscom_interface.setup_game_over_observer()
 
                 # Re-initialise the move observer now that the game page is loaded.
                 # The initial setup (at startup) runs before any game is open, so
@@ -320,6 +458,10 @@ class VariantsClient:
         print("  - 'c <variant>' / 'challenge <variant>' - Create a challenge (e.g. c chaturanga, c gothic, c koth)")
         print("  - 'loop start <v1> [v2 ...]' - Auto-loop: challenge all listed variants, play, rematch, repeat")
         print("  - 'loop stop'                - Stop the running loop after the current operation")
+        print("  - 'engines list'             - List available engine executables in engines/")
+        print("  - 'engine activate <name>'   - Activate an engine (plays moves in place of you)")
+        print("  - 'engine deactivate'        - Deactivate the engine (return to manual play)")
+        print("  - 'engine status'            - Show which engine is active")
         print("  - 'status' - Check current game state (in game or not)")
         print("  - 'getmove' - Detect the last move played on the board (UCI format)")
         print("  - 'movelist' - Print the move history for the current game")
@@ -414,6 +556,71 @@ class VariantsClient:
                         print(f"[Error] Failed to create challenge for {variant}")
                     print()
                     continue
+                elif command == 'engines list':
+                    engines = self.engine_manager.list_engines()
+                    if engines:
+                        print(f"[Engines] Found {len(engines)} engine(s) in engines/:")
+                        for name in engines:
+                            marker = " *" if name == self.engine_manager.active_engine_name else ""
+                            print(f"  {name}{marker}")
+                    else:
+                        print("[Engines] No executables found in engines/ folder.")
+                        print("[Engines] Drop a UCI-compatible engine binary there and try again.")
+                    print()
+                    continue
+                elif command.startswith('engine activate'):
+                    parts = user_input.split(None, 2)
+                    if len(parts) < 3:
+                        print("[Error] Usage: engine activate <name>")
+                        print()
+                        continue
+                    name = parts[2].strip()
+                    ok, msg = self.engine_manager.activate(name)
+                    if ok:
+                        print(f"[Engine] ✓ {msg}")
+                    else:
+                        print(f"[Engine] ✗ {msg}")
+                    print()
+                    continue
+                elif command == 'engine deactivate':
+                    name = self.engine_manager.deactivate()
+                    if name:
+                        print(f"[Engine] ✓ Engine '{name}' deactivated — returning to manual play.")
+                    else:
+                        print("[Engine] No engine was active.")
+                    print()
+                    continue
+                elif command == 'engine status':
+                    if self.engine_manager.is_configured:
+                        em = self.engine_manager
+                        running = em.process is not None
+                        state = "running" if running else "idle (starts on next game)"
+                        print(f"[Engine] Active: {em.active_engine_name} ({state})")
+                        print(f"[Engine] Search: {em.search_config_str()}")
+                        if running and em.search_mode == 'time':
+                            print(f"[Engine] Clock:  {em.engine_color}={em.engine_time}ms")
+                    else:
+                        print("[Engine] No engine active — use 'engine activate <name>'.")
+                    print()
+                    continue
+                elif command.startswith('config mode'):
+                    parts = command.split()
+                    # config mode nodes [N]
+                    if len(parts) >= 3 and parts[2] == 'nodes':
+                        nodes = int(parts[3]) if len(parts) >= 4 else 1_000_000
+                        self.engine_manager.set_search_nodes(nodes)
+                        print(f"[Engine] Search mode → nodes {nodes:,}")
+                    # config mode time <base_ms> <inc_ms>
+                    elif len(parts) >= 5 and parts[2] == 'time':
+                        base = int(parts[3])
+                        inc  = int(parts[4])
+                        self.engine_manager.set_search_time(base, inc)
+                        print(f"[Engine] Search mode → time  base={base}ms  inc={inc}ms")
+                    else:
+                        print("[Error] Usage: config mode nodes [N]")
+                        print("[Error]        config mode time <base_ms> <inc_ms>")
+                    print()
+                    continue
                 elif command == 'status':
                     print("[Client] Checking game state...")
                     # First check player color with verbose output for debugging
@@ -491,6 +698,35 @@ class VariantsClient:
             except Exception as e:
                 print(f"[Error] {e}")
                 print()
+
+    # ── Engine integration ───────────────────────────────────────────────────
+
+    def _trigger_engine_move(self):
+        """Ask the active engine for a move and execute it on the board.
+
+        Runs the search in a background thread (via EngineManager.request_move)
+        so the monitor thread is never blocked.
+        """
+        # Capture the current generation.  If game over fires and a new game
+        # starts before the search finishes, the generation will have changed
+        # and the stale callback will discard its result instead of making a
+        # move on the wrong (or already-finished) game.
+        generation = self._game_generation
+
+        def on_best_move(uci_move):
+            if not uci_move:
+                return
+            if self._game_generation != generation:
+                _bg_print(f"[Engine] Discarding stale move {uci_move} "
+                          f"(game ended during search)")
+                return
+            self.move_list += uci_move + " "
+            _bg_print(f"[Engine] Playing: {uci_move}")
+            success = self.chesscom_interface.make_move(uci_move)
+            if not success:
+                _bg_print(f"[Engine] ✗ Failed to execute move: {uci_move}")
+
+        self.engine_manager.request_move(self.move_list, on_best_move)
 
     # ── Variant loop ────────────────────────────────────────────────────────
 
@@ -616,13 +852,29 @@ class VariantsClient:
                 # ── Wait for game-over (always, even if stop was requested) ───
                 # handle_game_over() sets game_over_handled_for first, then
                 # dismisses the dialog, waits 2 s, and only then clears
-                # current_game_number. Waiting for both conditions ensures
-                # rematch() is never called while the dialog is still open.
+                # current_game_number.  We must also handle the race where the
+                # opponent accepted a rematch so fast that check_for_game_start()
+                # already detected the new game during handle_game_over()'s sleep
+                # — in that case current_game_number will be the *new* game number
+                # (not None) by the time we reach here.
+                rematch_already_accepted = False
                 while True:
-                    if (self.game_over_handled_for == game_num
-                            and self.current_game_number is None):
-                        break
+                    if self.game_over_handled_for == game_num:
+                        cur = self.current_game_number
+                        if cur is None:
+                            # Normal path: game over fully processed.
+                            break
+                        if cur != game_num:
+                            # New game detected during handle_game_over()'s sleep;
+                            # skip the rematch button — game is already running.
+                            rematch_already_accepted = True
+                            break
                     time.sleep(0.5)
+
+                if rematch_already_accepted:
+                    _bg_print(f"[Loop] Rematch pre-accepted — "
+                              f"Game #{self.current_game_number}")
+                    continue  # Stay in inner loop for the new game
 
                 # Extra pause so the Rematch button is fully rendered.
                 time.sleep(1.0)
@@ -683,6 +935,11 @@ class VariantsClient:
     def cleanup(self):
         """Clean up resources."""
         print("[Client] Cleaning up...")
+
+        # Stop engine process before anything else.
+        if self.engine_manager.process is not None:
+            print("[Engine] Stopping engine process...")
+            self.engine_manager.stop()
 
         # Stop background thread FIRST before closing browser session
         self.stop_background_monitor()

@@ -861,7 +861,7 @@ class ChessComInterface:
                     'x': from_coords['x'],
                     'y': from_coords['y']
                 })
-                time.sleep(0.03)  # 30ms like Puppeteer
+                time.sleep(0.01)
 
                 # Mouse down
                 self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
@@ -871,7 +871,7 @@ class ChessComInterface:
                     'button': 'left',
                     'clickCount': 1
                 })
-                time.sleep(0.05)
+                time.sleep(0.02)
 
                 # Drag to destination with steps (like Puppeteer's steps: 3)
                 steps = 3
@@ -884,7 +884,6 @@ class ChessComInterface:
                         'y': y,
                         'button': 'left'
                     })
-                    time.sleep(0.01)
 
                 # Mouse up at destination
                 self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
@@ -900,7 +899,7 @@ class ChessComInterface:
                 return False
 
             # Wait for move to process
-            time.sleep(0.15)
+            time.sleep(0.05)
             return True
 
         except Exception as e:
@@ -1709,7 +1708,7 @@ class ChessComInterface:
                     'x': from_coords['x'],
                     'y': from_coords['y']
                 })
-                time.sleep(0.03)
+                time.sleep(0.01)
 
                 # Mouse down on pocket piece
                 self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
@@ -1719,7 +1718,7 @@ class ChessComInterface:
                     'button': 'left',
                     'clickCount': 1
                 })
-                time.sleep(0.05)
+                time.sleep(0.02)
 
                 # Drag to destination square with steps
                 steps = 3
@@ -1732,7 +1731,6 @@ class ChessComInterface:
                         'y': y,
                         'button': 'left'
                     })
-                    time.sleep(0.01)
 
                 # Mouse up at destination
                 self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
@@ -1744,7 +1742,7 @@ class ChessComInterface:
                 })
 
                 # Wait for move to process
-                time.sleep(0.15)
+                time.sleep(0.05)
                 return True
 
             except Exception as cdp_error:
