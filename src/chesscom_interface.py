@@ -42,19 +42,37 @@ class ChessComInterface:
     # ── Board-parameter cache ─────────────────────────────────────────────────
 
     def _get_cached_board_params(self, max_age=60.0):
-        """Return (is_flipped, board_size), refreshing at most every max_age seconds.
+        """Return (is_flipped, board_size, board_rect), refreshing at most every max_age seconds.
 
-        Board orientation and dimensions are constant within a game, so
-        calling is_board_flipped() + detect_board_size() on every move wastes
-        ~80 ms in WebDriver round-trips.  This cache eliminates that overhead
-        for all subsequent moves after the first.
+        Board orientation, dimensions, and on-screen position are constant
+        within a game; recomputing them on every move wastes execute_script
+        round-trips (~80-120 ms each, and much worse when the tab is occluded
+        and Chrome throttles JS execution).  The cache is invalidated
+        externally when a new game starts.
+
+        board_rect is {'left': float, 'top': float, 'width': float} and is
+        extracted at no extra cost from the debug info already returned by
+        get_board_orientation().  Callers can use _coords_for_square_py()
+        to compute pixel coordinates in pure Python with zero execute_script
+        calls.  board_rect may be None if the board element was not found.
         """
         now = time.monotonic()
         if self._board_params_cache and (now - self._board_params_time < max_age):
             return self._board_params_cache
-        is_flipped = self.is_board_flipped()
+        # get_board_orientation() already calls getBoundingClientRect() and
+        # stores the result in debug.boardInfo — extract it for free rather
+        # than running a separate script just to get the board rect.
+        orientation = self.get_board_orientation()
+        is_flipped  = orientation['is_flipped']
+        board_info  = orientation.get('debug', {}).get('boardInfo') or {}
+        board_rect  = (
+            {'left': board_info['left'], 'top': board_info['top'],
+             'width': board_info['width']}
+            if board_info.get('width')
+            else None
+        )
         board_size  = self.detect_board_size()
-        self._board_params_cache = (is_flipped, board_size)
+        self._board_params_cache = (is_flipped, board_size, board_rect)
         self._board_params_time  = now
         return self._board_params_cache
 
@@ -62,6 +80,30 @@ class ChessComInterface:
         """Discard cached board parameters (call when a new game starts)."""
         self._board_params_cache = None
         self._board_params_time  = 0.0
+
+    def _coords_for_square_py(self, square, is_flipped, board_size, board_rect):
+        """Return {'x': float, 'y': float} for square using pure Python arithmetic.
+
+        This is the execute_script-free fast path for coordinate lookup.
+        Requires board_rect from the cache (populated by _get_cached_board_params).
+        The math mirrors what get_two_square_coordinates() does in JS.
+        """
+        file_letter  = square[0].lower()
+        rank_number  = int(square[1:])
+        file_num     = ord(file_letter) - ord('a') + 1
+        num_files    = board_size.get('files', 8)
+        num_ranks    = board_size.get('ranks', 8)
+        sq_size      = board_rect['width'] / num_files
+        if is_flipped:
+            fi = num_files - file_num
+            ri = rank_number - 1
+        else:
+            fi = file_num - 1
+            ri = num_ranks - rank_number
+        return {
+            'x': board_rect['left'] + fi * sq_size + sq_size / 2,
+            'y': board_rect['top']  + ri * sq_size + sq_size / 2,
+        }
 
     def inject_background_fix(self):
         """Override Page Visibility API so chess.com stays active when the
@@ -969,18 +1011,28 @@ class ChessComInterface:
 
             print(f"[ChessCom] Move: {from_square} → {to_square}")
 
-            # Use cached board orientation/size (TTL 60 s, invalidated between
-            # games).  Board params are constant for a game's lifetime, so this
-            # eliminates 2–3 execute_script round-trips on every move after the
-            # first — particularly important when the tab is backgrounded and
-            # Chrome throttles JS execution aggressively.
-            is_flipped, board_size = self._get_cached_board_params()
+            # Board geometry is stable for an entire game.  The cache is
+            # filled with one execute_script on the first move (TTL 60 s,
+            # explicit invalidation between games) and reused at zero cost
+            # for every subsequent move — critical when the tab is occluded
+            # and Chrome throttles JS execution to several seconds per call.
+            is_flipped, board_size, board_rect = self._get_cached_board_params()
 
-            # Fetch both square centres in a single execute_script call instead
-            # of two separate get_square_coordinates() calls (~40 ms saved).
-            from_coords, to_coords = self.get_two_square_coordinates(
-                from_square, to_square, is_flipped, board_size
-            )
+            # Compute square centres in pure Python from the cached board
+            # rect.  This replaces the per-move execute_script in
+            # get_two_square_coordinates() with simple arithmetic, so the
+            # hot path after the first move contains zero execute_script
+            # calls and is completely immune to Chrome's occlusion throttling.
+            if board_rect:
+                from_coords = self._coords_for_square_py(
+                    from_square, is_flipped, board_size, board_rect)
+                to_coords   = self._coords_for_square_py(
+                    to_square,   is_flipped, board_size, board_rect)
+            else:
+                # Fallback: board element not found in cache; use the JS path.
+                from_coords, to_coords = self.get_two_square_coordinates(
+                    from_square, to_square, is_flipped, board_size
+                )
 
             if not from_coords or not to_coords:
                 print(f"[ChessCom] ✗ Could not find board squares")
@@ -3633,7 +3685,7 @@ class ChessComInterface:
         """
         # Use shared cache so the board-param round-trips already paid by the
         # monitor cycle (or by make_move_cdp) are not repeated here.
-        is_flipped, board_size = self._get_cached_board_params()
+        is_flipped, board_size, _board_rect = self._get_cached_board_params()
         variant_name = self.get_variant_name()
         num_files = board_size.get('files', 8)
         num_ranks = board_size.get('ranks', 8)
