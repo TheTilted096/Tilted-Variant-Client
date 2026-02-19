@@ -41,7 +41,7 @@ class ChessComInterface:
 
     # ── Board-parameter cache ─────────────────────────────────────────────────
 
-    def _get_cached_board_params(self, max_age=4.0):
+    def _get_cached_board_params(self, max_age=60.0):
         """Return (is_flipped, board_size), refreshing at most every max_age seconds.
 
         Board orientation and dimensions are constant within a game, so
@@ -969,9 +969,11 @@ class ChessComInterface:
 
             print(f"[ChessCom] Move: {from_square} → {to_square}")
 
-            # Use cached board orientation/size (refreshed at most every 4 s).
-            # This avoids two separate execute_script round-trips (~80 ms) that
-            # would otherwise repeat what get_last_move() already computed.
+            # Use cached board orientation/size (TTL 60 s, invalidated between
+            # games).  Board params are constant for a game's lifetime, so this
+            # eliminates 2–3 execute_script round-trips on every move after the
+            # first — particularly important when the tab is backgrounded and
+            # Chrome throttles JS execution aggressively.
             is_flipped, board_size = self._get_cached_board_params()
 
             # Fetch both square centres in a single execute_script call instead

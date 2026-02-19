@@ -69,6 +69,13 @@ class VariantsClient:
         self._loop_restart_required = False
         # Timestamp of the last promo-banner check (monotonic seconds).
         self._last_promo_check = 0.0
+        # Guard against false game-over signals during the new-game setup
+        # window.  Set to False as soon as a new game number is confirmed,
+        # and back to True only after setup_game_over_observer() completes.
+        # handle_game_over() is a no-op while this is False, preventing stale
+        # DOM / cached __gameOverResult from the previous game from being
+        # misread as the new game having immediately ended.
+        self._new_game_settled = True
 
     def start(self):
         """Start the variants client."""
@@ -298,6 +305,15 @@ class VariantsClient:
             if game_number == self.game_over_handled_for:
                 return
 
+            # Block during the new-game setup window.
+            # check_for_game_start() sets this False as soon as a new game
+            # number is confirmed and True only after setup_game_over_observer()
+            # completes (clearing window.__gameOverResult and reinstalling the
+            # observer).  Without this guard, stale DOM / cached results from
+            # the previous game can trigger a false game-over for the new one.
+            if not self._new_game_settled:
+                return
+
             # Run full detection to get details
             game_over_info = self.chesscom_interface.detect_game_over()
 
@@ -396,6 +412,13 @@ class VariantsClient:
                 if new_number == self.last_game_number:
                     return
 
+                # Raise the gate BEFORE assigning the new game number.
+                # handle_game_over() is a no-op while False, so stale DOM /
+                # cached __gameOverResult from the previous game cannot be
+                # misread as an immediate loss for the new game during the
+                # window between game-number assignment and observer reset.
+                self._new_game_settled = False
+
                 _bg_print("=" * 60)
                 _bg_print("[Game State] 🎮 GAME STARTED!")
                 _bg_print(f"[Game State] Game #{new_number}")
@@ -463,6 +486,11 @@ class VariantsClient:
                     _bg_print("[Game State] ✓ Move observer re-initialised")
                 else:
                     _bg_print("[Game State] ⚠ Could not re-initialise move observer")
+
+                # Setup is complete: the game-over observer is live and its
+                # stale-result cache has been cleared.  Re-enable game-over
+                # detection for this game.
+                self._new_game_settled = True
 
         except Exception as e:
             # Silently handle errors
