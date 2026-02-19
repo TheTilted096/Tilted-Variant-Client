@@ -1004,18 +1004,39 @@ class ChessComInterface:
                 })
                 time.sleep(0.02)
 
-                # Single intermediate drag point → destination.
-                # chess.com's drag listener only needs mousedown + ≥1 mousemove
-                # + mouseup; reducing from 3 steps to 1 saves 2 CDP round-trips
-                # (~80 ms) with no effect on move reliability.
-                mid_x = (from_coords['x'] + to_coords['x']) / 2
-                mid_y = (from_coords['y'] + to_coords['y']) / 2
-                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                    'type': 'mouseMoved',
-                    'x': mid_x,
-                    'y': mid_y,
-                    'button': 'left'
-                })
+                # Smooth 8-frame drag animation dispatched in a SINGLE
+                # execute_script call.  Sending each frame as a separate
+                # execute_cdp_cmd would cost ~40 ms × 8 = ~320 ms; batching
+                # them into one JS round-trip keeps the cost near zero while
+                # giving chess.com's drag listener a convincing sweep path.
+                # Both PointerEvent and MouseEvent are fired for each frame
+                # to match what a real mouse drag produces.
+                from_x = from_coords['x']
+                from_y = from_coords['y']
+                to_x   = to_coords['x']
+                to_y   = to_coords['y']
+                self.driver.execute_script(f"""
+                    const frames = 8;
+                    const fx = {from_x}, fy = {from_y};
+                    const tx = {to_x},   ty = {to_y};
+                    for (let i = 1; i <= frames; i++) {{
+                        const t  = i / (frames + 1);
+                        const x  = fx + (tx - fx) * t;
+                        const y  = fy + (ty - fy) * t;
+                        const el = document.elementFromPoint(x, y) || document.body;
+                        el.dispatchEvent(new PointerEvent('pointermove', {{
+                            bubbles: true, cancelable: true,
+                            clientX: x, clientY: y, screenX: x, screenY: y,
+                            pointerId: 1, pointerType: 'mouse', isPrimary: true,
+                            button: -1, buttons: 1
+                        }}));
+                        el.dispatchEvent(new MouseEvent('mousemove', {{
+                            bubbles: true, cancelable: true,
+                            clientX: x, clientY: y, screenX: x, screenY: y,
+                            button: 0, buttons: 1
+                        }}));
+                    }}
+                """)
 
                 # Mouse up at destination
                 self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
