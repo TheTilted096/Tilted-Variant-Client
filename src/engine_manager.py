@@ -304,14 +304,15 @@ class EngineManager:
             return
 
         self._searching = True
+        t_relay_start = time.monotonic()
         thread = threading.Thread(
             target=self._search_worker,
-            args=(move_list, callback),
+            args=(move_list, callback, t_relay_start),
             daemon=True,
         )
         thread.start()
 
-    def _search_worker(self, move_list, callback):
+    def _search_worker(self, move_list, callback, t_relay_start=None):
         """Background thread: send position + go, parse bestmove."""
         try:
             stripped = move_list.strip()
@@ -339,22 +340,25 @@ class EngineManager:
             else:
                 go_cmd = f"go nodes {self.nodes_count}\n"
 
+            # relay_ms: time from request_move() call to the moment we send
+            # the go command — covers thread scheduling + position command I/O.
             t0 = time.monotonic()
+            relay_ms = int((t0 - t_relay_start) * 1000) if t_relay_start is not None else 0
             self._send(go_cmd)
             best = self._read_until_bestmove(timeout=120.0)
-            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            think_ms = int((time.monotonic() - t0) * 1000)
 
             if best:
                 # Decrement only the engine's own clock.
                 if self.search_mode == 'time':
                     self.engine_time = max(
-                        0, self.engine_time - elapsed_ms + self.time_increment
+                        0, self.engine_time - think_ms + self.time_increment
                     )
                     self._log(
                         f"# clock: {self.engine_color}={self.engine_time}ms"
-                        f" (used {elapsed_ms}ms)"
+                        f" (used {think_ms}ms)"
                     )
-                callback(best)
+                callback(best, think_ms, relay_ms)
         finally:
             self._searching = False
 
