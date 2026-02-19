@@ -76,6 +76,10 @@ class VariantsClient:
         # DOM / cached __gameOverResult from the previous game from being
         # misread as the new game having immediately ended.
         self._new_game_settled = True
+        # Monotonic timestamp of when the current game's setup completed and
+        # game-over detection was re-enabled.  Used to enforce a minimum game
+        # age before accepting any game-over signal (see handle_game_over).
+        self._game_start_time = 0.0
 
     def start(self):
         """Start the variants client."""
@@ -314,6 +318,22 @@ class VariantsClient:
             if not self._new_game_settled:
                 return
 
+            # Enforce a minimum game age before accepting any game-over signal.
+            #
+            # The MutationObserver from the previous game can fire on DOM
+            # mutations that carry stale result text and write a console log.
+            # That log is buffered in the monitor queue and may be read in the
+            # next iteration AFTER _new_game_settled is already True, bypassing
+            # the flag above.  Stale events always arrive within a few hundred
+            # milliseconds of game start; real games virtually never end that
+            # quickly.  Any legitimate near-instant game-over that falls inside
+            # this window is still caught by the fallback DOM scan, which uses
+            # tighter selectors (large modal dialogs only) and fires 2 s after
+            # game detection — well after this window expires.
+            _MIN_GAME_AGE = 3.0  # seconds
+            if time.monotonic() - self._game_start_time < _MIN_GAME_AGE:
+                return
+
             # Run full detection to get details
             game_over_info = self.chesscom_interface.detect_game_over()
 
@@ -488,6 +508,7 @@ class VariantsClient:
                 # stale-result cache has been cleared.  Re-enable game-over
                 # detection for this game.
                 self._new_game_settled = True
+                self._game_start_time = time.monotonic()
 
         except Exception as e:
             # Silently handle errors
