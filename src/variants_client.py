@@ -811,7 +811,7 @@ class VariantsClient:
             # common form and is trivially reliable to detect.
             current_url = driver.current_url
             BAD_URL_FRAGMENTS = ('/membership', '/premium', '/upgrade',
-                                 '/subscription', '/pricing')
+                                 '/subscription', '/pricing', '/other')
             is_promo = any(frag in current_url for frag in BAD_URL_FRAGMENTS)
 
             # ── Secondary: DOM overlay scan ───────────────────────────────────
