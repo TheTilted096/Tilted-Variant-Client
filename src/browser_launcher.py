@@ -70,18 +70,30 @@ class BrowserLauncher:
             "--remote-debugging-address=127.0.0.1",
             "--no-first-run",
             "--no-default-browser-check",
-            "--new-window",  # Open in standalone window
+            "--new-window",
             "--start-maximized",
-            "--app=https://www.chess.com/variants",  # App mode for cleaner standalone window
-            # ── Background operation flags ────────────────────────────────────
-            # Prevent the renderer from being throttled or paused when the
-            # browser window is not in focus or is behind another full-screen
-            # app.  Without these flags chess.com detects the hidden state and
-            # stops responding to synthetic mouse events.
+            # ── Background / occlusion / throttling flags ─────────────────────
+            # Layer 1 – renderer process: prevent the renderer from being
+            # deprioritised when the window loses focus or is hidden.
             "--disable-background-timer-throttling",
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
             "--disable-background-media-suspend",
+            # Layer 2 – Chrome feature flags that cause the "works briefly then
+            # spikes" pattern observed when the window is minimised/covered:
+            #   IntensiveWakeUpThrottling – throttles JS timers to ≤1/minute
+            #     after 5 s of the page being hidden.  This is the primary
+            #     cause of the delayed spike: the grace period hides the
+            #     problem at first, then latency jumps to ~5 s once it kicks in.
+            #   CalculateNativeWinOcclusion – Windows-specific: uses the Win32
+            #     API to track whether the browser window is occluded/minimised
+            #     and triggers a separate throttling path that --disable-
+            #     backgrounding-occluded-windows does not cover.
+            "--disable-features=IntensiveWakeUpThrottling,CalculateNativeWinOcclusion",
+            # Open the variants lobby in a full browser window (not app/PWA
+            # mode) so that installed extensions such as Cold Turkey Blocker
+            # are active and the instance is recognised as a normal Edge tab.
+            "https://www.chess.com/variants",
         ]
 
         try:
@@ -116,6 +128,36 @@ class BrowserLauncher:
             # Connect to existing Edge instance
             self.driver = webdriver.Edge(options=edge_options)
             print("[Browser] Successfully connected to Edge!")
+
+            # ── CDP anti-throttling (survives page navigations) ───────────────
+            # Layer 3 – focus emulation: Chrome's focus-loss throttling is
+            # suppressed entirely; the tab always behaves as if it has focus.
+            try:
+                self.driver.execute_cdp_cmd(
+                    'Emulation.setFocusEmulationEnabled', {'enabled': True}
+                )
+            except Exception:
+                pass
+
+            # Layer 4 – Page Visibility API override: inject a script that
+            # runs on every new document so chess.com (and any other page code
+            # that pauses on visibilityState === 'hidden') always sees the
+            # page as visible, even when the window is minimised or covered.
+            try:
+                self.driver.execute_cdp_cmd(
+                    'Page.addScriptToEvaluateOnNewDocument',
+                    {
+                        'source': (
+                            'Object.defineProperty(document,"visibilityState",'
+                            '{get:()=>"visible",configurable:true});'
+                            'Object.defineProperty(document,"hidden",'
+                            '{get:()=>false,configurable:true});'
+                        )
+                    },
+                )
+            except Exception:
+                pass
+
             return self.driver
 
         except Exception as e:

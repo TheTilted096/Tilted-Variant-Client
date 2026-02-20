@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import threading
+from collections import deque
 from browser_launcher import BrowserLauncher
 from chesscom_interface import ChessComInterface
 from uci_handler import UCIHandler
@@ -80,6 +81,10 @@ class VariantsClient:
         # game-over detection was re-enabled.  Used to enforce a minimum game
         # age before accepting any game-over signal (see handle_game_over).
         self._game_start_time = 0.0
+        # Timing history for the 'ping' graph: deque of
+        # (detect_ms, engine_ms, exec_ms, overhead_ms) tuples, newest last.
+        self._timing_history = deque(maxlen=15)
+        self._ping_thread = None
 
     def start(self):
         """Start the variants client."""
@@ -537,6 +542,7 @@ class VariantsClient:
         print("  - 'status' - Check current game state (in game or not)")
         print("  - 'getmove' - Detect the last move played on the board (UCI format)")
         print("  - 'movelist' - Print the move history for the current game")
+        print("  - 'ping' - Open a live graph of move-cycle overhead for the last 25 moves")
         print("  - 'quit' - Exit the client")
         print()
         print("=" * 60)
@@ -732,6 +738,10 @@ class VariantsClient:
                     print(f"[movelist] {self.move_list}")
                     print()
                     continue
+                elif command == 'ping':
+                    self._open_ping_window()
+                    print()
+                    continue
 
                 # Try to parse as UCI move (preserve original case for drop moves)
                 parsed_move = UCIHandler.parse_uci_move(user_input)
@@ -884,6 +894,9 @@ class VariantsClient:
                 f"[Timing] detect={detect_ms}ms | "
                 f"engine={think_ms}ms | exec={exec_ms}ms | "
                 f"total={total_ms}ms (overhead={overhead_ms}ms)"
+            )
+            self._timing_history.append(
+                (detect_ms, think_ms, exec_ms, overhead_ms)
             )
 
         self.engine_manager.request_move(self.move_list, on_best_move)
@@ -1059,6 +1072,161 @@ class VariantsClient:
 
         _bg_print("[Loop] Stopped.")
         self.loop_running = False
+
+    # ── Ping / overhead graph ────────────────────────────────────────────────
+
+    def _open_ping_window(self):
+        """Open the live overhead graph in a background thread.
+
+        If the window is already open, print a notice instead of opening a
+        second one.  The terminal remains fully interactive while the graph
+        window is displayed.
+        """
+        if self._ping_thread is not None and self._ping_thread.is_alive():
+            print("[ping] Graph window is already open.")
+            return
+        self._ping_thread = threading.Thread(
+            target=self._ping_graph_thread, daemon=True
+        )
+        self._ping_thread.start()
+        print("[ping] Opening overhead graph window...")
+
+    def _ping_graph_thread(self):
+        """Background thread: render a live-updating overhead bar chart.
+
+        Each bar represents one move cycle, stacked as:
+          - bottom (blue)  = detect time  (opponent-move detection)
+          - top    (red)   = exec time    (DOM move injection)
+          bar height = overhead = detect + exec  (i.e. non-engine time)
+
+        A dashed yellow line marks the rolling mean overhead.
+        The chart refreshes every 500 ms automatically.
+
+        Tkinter and the Figure are created directly in this thread to avoid
+        the pyplot thread-safety warning that appears when plt.subplots() /
+        plt.show() are called from a non-main thread.  root.after() schedules
+        redraws on the Tk event loop that owns the window, which is the
+        correct way to animate from a background thread.
+        """
+        try:
+            import tkinter as tk
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            from matplotlib.figure import Figure
+        except ImportError:
+            _bg_print(
+                "[ping] matplotlib is required for the graph — "
+                "run: pip install matplotlib"
+            )
+            return
+
+        BG       = '#1e1e2e'
+        C_DETECT = '#4c8eda'   # blue  — detect segment
+        C_EXEC   = '#e07060'   # coral — exec segment
+        C_MEAN   = '#f0e080'   # yellow dashed — mean overhead line
+        C_TEXT   = '#d0d0d0'
+        C_GRID   = '#2e2e4e'
+        C_SPINE  = '#44445e'
+
+        root = tk.Tk()
+        root.title('Tilted — Move Overhead')
+        root.configure(bg=BG)
+
+        fig = Figure(figsize=(11, 4), facecolor=BG)
+        ax  = fig.add_subplot(111)
+
+        canvas = FigureCanvasTkAgg(fig, master=root)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Mutable cell so update() can store its own after-ID for cancellation.
+        after_id = [None]
+
+        def _style_ax():
+            ax.set_facecolor(BG)
+            for sp in ax.spines.values():
+                sp.set_edgecolor(C_SPINE)
+            ax.tick_params(colors=C_TEXT)
+            ax.xaxis.label.set_color(C_TEXT)
+            ax.yaxis.label.set_color(C_TEXT)
+
+        def on_close():
+            # Cancel any pending redraw callback before destroying the window.
+            # This releases Tk's reference to the update closure (and through
+            # it, canvas → PhotoImage), so those objects are finalized here
+            # in the background thread rather than later by the main thread's
+            # GC, which would raise "main thread is not in main loop".
+            if after_id[0] is not None:
+                try:
+                    root.after_cancel(after_id[0])
+                except Exception:
+                    pass
+            root.destroy()
+
+        root.protocol("WM_DELETE_WINDOW", on_close)
+
+        def update():
+            try:
+                ax.cla()
+                _style_ax()
+
+                history = list(self._timing_history)
+                n = len(history)
+
+                if n == 0:
+                    ax.text(
+                        0.5, 0.5,
+                        'No moves yet — waiting for engine moves...',
+                        ha='center', va='center', transform=ax.transAxes,
+                        color=C_TEXT, fontsize=12,
+                    )
+                    ax.set_title(
+                        'Move Cycle Overhead', color=C_TEXT, fontsize=13
+                    )
+                else:
+                    xs       = list(range(n))
+                    detect   = [h[0] for h in history]
+                    exec_t   = [h[2] for h in history]
+                    overhead = [h[3] for h in history]
+                    mean_oh  = sum(overhead) / n
+
+                    ax.bar(xs, detect, color=C_DETECT, label='detect', zorder=2)
+                    ax.bar(xs, exec_t, bottom=detect, color=C_EXEC,
+                           label='exec', zorder=2)
+                    ax.axhline(
+                        mean_oh, color=C_MEAN, linestyle='--', linewidth=1.3,
+                        label=f'mean {mean_oh:.0f} ms', zorder=3,
+                    )
+                    ax.set_xlabel(
+                        'Move  (oldest → newest)', color=C_TEXT, fontsize=9
+                    )
+                    ax.set_ylabel('Time (ms)', color=C_TEXT, fontsize=9)
+                    ax.set_title(
+                        f'Move Cycle Overhead — last {n}  |  '
+                        f'last={overhead[-1]} ms    avg={mean_oh:.0f} ms    '
+                        f'max={max(overhead)} ms',
+                        color=C_TEXT, fontsize=10,
+                    )
+                    ax.set_xlim(-0.6, max(n, 1) - 0.4)
+                    ax.set_ylim(0, max(max(overhead) * 1.30, 200))
+                    ax.set_xticks(xs)
+                    ax.set_xticklabels(
+                        [str(i + 1) for i in range(n)],
+                        color=C_TEXT, fontsize=7,
+                    )
+                    ax.legend(
+                        loc='upper left',
+                        facecolor='#2a2a3e', edgecolor=C_SPINE,
+                        labelcolor=C_TEXT, fontsize=8,
+                    )
+                    ax.grid(axis='y', color=C_GRID, linewidth=0.7, zorder=0)
+
+                fig.tight_layout()
+                canvas.draw()
+                after_id[0] = root.after(500, update)
+            except tk.TclError:
+                pass  # Window was closed — stop scheduling further redraws
+
+        update()
+        root.mainloop()
 
     def cleanup(self):
         """Clean up resources."""
