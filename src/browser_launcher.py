@@ -127,6 +127,9 @@ class BrowserLauncher:
         try:
             # Connect to existing Edge instance
             self.driver = webdriver.Edge(options=edge_options)
+            # execute_async_script needs an explicit timeout; 5 s is ample
+            # for any in-page async work (inter-click gap is ≤ 200 ms).
+            self.driver.set_script_timeout(5)
             print("[Browser] Successfully connected to Edge!")
 
             # ── CDP anti-throttling (survives page navigations) ───────────────
@@ -202,9 +205,29 @@ class BrowserLauncher:
             print("[Browser] Terminating Edge process...")
             try:
                 if sys.platform == "win32":
-                    # Windows: use taskkill to force close
-                    subprocess.run(['taskkill', '/F', '/T', '/PID', str(self.edge_process.pid)],
-                                   capture_output=True)
+                    # Primary: find the process listening on our debugging port
+                    # and kill its entire process tree.  The stored PID
+                    # (self.edge_process.pid) may belong to a short-lived
+                    # launcher that already exited and handed off to an existing
+                    # Edge instance, making a direct /PID kill unreliable.
+                    port = self.debugging_port
+                    ps_cmd = (
+                        f'$p = (Get-NetTCPConnection -LocalPort {port} '
+                        f'-State Listen -ErrorAction SilentlyContinue'
+                        f').OwningProcess | Select-Object -First 1; '
+                        f'if ($p) {{ taskkill /F /T /PID $p | Out-Null }}'
+                    )
+                    subprocess.run(
+                        ['PowerShell', '-NoProfile', '-Command', ps_cmd],
+                        capture_output=True, timeout=10,
+                    )
+                    # Fallback: also attempt by stored PID in case the
+                    # debugging port is not yet bound (e.g. killed very early).
+                    subprocess.run(
+                        ['taskkill', '/F', '/T', '/PID',
+                         str(self.edge_process.pid)],
+                        capture_output=True,
+                    )
                 else:
                     # Unix-like: send SIGTERM
                     self.edge_process.terminate()

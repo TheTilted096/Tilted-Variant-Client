@@ -26,6 +26,10 @@ class ChessComInterface:
         # invalidated externally when a new game starts.
         self._board_params_cache = None   # (is_flipped: bool, board_size: dict)
         self._board_params_time  = 0.0    # monotonic timestamp of last refresh
+        # Variant name is stable for an entire game; caching it eliminates
+        # 1-2 execute_script calls (href + title) from every get_last_move()
+        # invocation.  Cleared alongside board params when a new game starts.
+        self._variant_name_cache = None   # str | None
 
     def focus_browser(self):
         """Bring the browser window to focus."""
@@ -80,6 +84,7 @@ class ChessComInterface:
         """Discard cached board parameters (call when a new game starts)."""
         self._board_params_cache = None
         self._board_params_time  = 0.0
+        self._variant_name_cache = None
 
     def _coords_for_square_py(self, square, is_flipped, board_size, board_rect):
         """Return {'x': float, 'y': float} for square using pure Python arithmetic.
@@ -1014,64 +1019,141 @@ class ChessComInterface:
                 print(f"[ChessCom] ✗ Could not find board squares")
                 return False
 
-            # Use CDP Input.dispatchMouseEvent for a click-click move.
+            # Click-click move: select piece, then click destination.
             #
             # Why click-click instead of drag:
             #   • Drag suppresses chess.com's CSS piece animation; the site
             #     tracks the cursor position directly, so any synthetic drag
-            #     (whether 1 step or 100) looks choppy because we control
-            #     the visual, not the CSS engine.
-            #   • Click-click (select piece → click destination) lets chess.com
-            #     handle the animation itself via CSS transitions at native
-            #     60 fps — exactly the same smooth motion as a human clicking.
-            #   • It also eliminates the execute_script call that caused
-            #     background-tab JS throttling (5 s overhead when minimised).
-            #     All five events below go through the CDP input pipeline,
-            #     which is not subject to background-tab throttling.
+            #     looks choppy.  Click-click lets chess.com handle the
+            #     animation itself via CSS transitions at native 60 fps.
+            #
+            # Primary path — single execute_script (one HTTP round-trip):
+            #   Five separate execute_cdp_cmd calls cost ~25-35 ms each on
+            #   Windows/Edge, totalling ~150 ms before any sleep is counted.
+            #   A single execute_script replaces all of them with one call.
+            #
+            # Fallback — CDP four-call sequence:
+            #   Used when execute_script returns False or raises; goes through
+            #   the browser's native input pipeline.
+            x_from, y_from = from_coords['x'], from_coords['y']
+            x_to,   y_to   = to_coords['x'],   to_coords['y']
+
+            # ── Primary: execute_async_script with 150 ms inter-click gap ────
+            # Five separate execute_cdp_cmd calls cost ~25-35 ms each on
+            # Windows/Edge (local HTTP overhead), totalling ~150 ms before any
+            # sleep is counted.  execute_async_script replaces all of them with
+            # a single HTTP round-trip that completes once the JS callback fires.
+            #
+            # Click-to-click animation requires two things beyond just firing
+            # two clicks:
+            #
+            #  1. Cursor-position context: chess.com tracks the global cursor
+            #     via document-level pointermove/mousemove listeners.  Without
+            #     a synthetic move event the board may not know where the cursor
+            #     "is", so the first click may not register as a piece selection.
+            #     We dispatch pointermove + mousemove to document before each
+            #     click to update that state.
+            #
+            #  2. Inter-click gap: the selection state (highlighted square, valid
+            #     move dots) must be committed and painted before the destination
+            #     click fires.  One requestAnimationFrame (~16 ms) is too short —
+            #     React's batching may collapse both clicks into one render pass,
+            #     skipping the CSS slide transition.  A 150 ms setTimeout gives
+            #     React time to commit, the browser to paint the selected state,
+            #     and the piece slide animation fires naturally on the second click.
+            js_ok = False
             try:
-                x_from, y_from = from_coords['x'], from_coords['y']
-                x_to,   y_to   = to_coords['x'],   to_coords['y']
+                js_ok = self.driver.execute_async_script("""
+                    var fx = arguments[0], fy = arguments[1];
+                    var tx = arguments[2], ty = arguments[3];
+                    var done = arguments[4];
 
-                # Move cursor to the source square.
-                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                    'type': 'mouseMoved',
-                    'x': x_from, 'y': y_from
-                })
+                    function moveCursor(x, y) {
+                        var base = {
+                            bubbles: true, cancelable: true, view: window,
+                            clientX: x, clientY: y, screenX: x, screenY: y,
+                            buttons: 0
+                        };
+                        document.dispatchEvent(new PointerEvent('pointermove',
+                            Object.assign({}, base, {
+                                pointerId: 1, pointerType: 'mouse', isPrimary: true
+                            })));
+                        document.dispatchEvent(new MouseEvent('mousemove', base));
+                    }
 
-                # Click source square → piece becomes selected.
-                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                    'type': 'mousePressed',
-                    'x': x_from, 'y': y_from,
-                    'button': 'left', 'clickCount': 1
-                })
-                time.sleep(0.015)
-                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                    'type': 'mouseReleased',
-                    'x': x_from, 'y': y_from,
-                    'button': 'left', 'clickCount': 1
-                })
-                time.sleep(0.05)   # let piece-selection state register
+                    function syntheticClick(x, y) {
+                        var el = document.elementFromPoint(x, y);
+                        if (!el) return false;
+                        function mkP(t, b) {
+                            return new PointerEvent(t, {
+                                bubbles: true, cancelable: true, view: window,
+                                clientX: x,  clientY: y,
+                                screenX: x,  screenY: y,
+                                pointerId: 1, pointerType: 'mouse',
+                                isPrimary: true, button: 0, buttons: b
+                            });
+                        }
+                        function mkM(t, b) {
+                            return new MouseEvent(t, {
+                                bubbles: true, cancelable: true, view: window,
+                                clientX: x,  clientY: y,
+                                screenX: x,  screenY: y,
+                                button: 0, buttons: b
+                            });
+                        }
+                        el.dispatchEvent(mkP('pointerdown', 1));
+                        el.dispatchEvent(mkM('mousedown',   1));
+                        el.dispatchEvent(mkP('pointerup',   0));
+                        el.dispatchEvent(mkM('mouseup',     0));
+                        el.dispatchEvent(mkM('click',       0));
+                        return true;
+                    }
 
-                # Click destination square → piece placed; chess.com fires
-                # its CSS transition animation from here.
-                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                    'type': 'mousePressed',
-                    'x': x_to, 'y': y_to,
-                    'button': 'left', 'clickCount': 1
-                })
-                time.sleep(0.015)
-                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                    'type': 'mouseReleased',
-                    'x': x_to, 'y': y_to,
-                    'button': 'left', 'clickCount': 1
-                })
+                    moveCursor(fx, fy);
+                    if (!syntheticClick(fx, fy)) { done(false); return; }
+                    setTimeout(function() {
+                        moveCursor(tx, ty);
+                        done(syntheticClick(tx, ty));
+                    }, 150);
+                """, x_from, y_from, x_to, y_to) or False
+            except Exception:
+                pass
 
-            except Exception as cdp_error:
-                print(f"[ChessCom] ✗ CDP error: {cdp_error}")
-                return False
+            if not js_ok:
+                # ── Fallback: CDP multi-call (four HTTP round-trips) ──────────
+                # Used when execute_script returns False (element not found) or
+                # raises an exception.  Slower but goes through the browser's
+                # native input pipeline.
+                try:
+                    self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                        'type': 'mousePressed',
+                        'x': x_from, 'y': y_from,
+                        'button': 'left', 'clickCount': 1
+                    })
+                    time.sleep(0.004)
+                    self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                        'type': 'mouseReleased',
+                        'x': x_from, 'y': y_from,
+                        'button': 'left', 'clickCount': 1
+                    })
+                    time.sleep(0.010)
+                    self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                        'type': 'mousePressed',
+                        'x': x_to, 'y': y_to,
+                        'button': 'left', 'clickCount': 1
+                    })
+                    time.sleep(0.004)
+                    self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                        'type': 'mouseReleased',
+                        'x': x_to, 'y': y_to,
+                        'button': 'left', 'clickCount': 1
+                    })
+                except Exception as cdp_error:
+                    print(f"[ChessCom] ✗ CDP error: {cdp_error}")
+                    return False
 
-            # Wait for move to process
-            time.sleep(0.05)
+            # Brief settle for chess.com to process the move.
+            time.sleep(0.010)
             return True
 
         except Exception as e:
@@ -2904,9 +2986,16 @@ class ChessComInterface:
             return True
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error in cancel_challenge: {e}")
-            import traceback
-            traceback.print_exc()
+            e_str = str(e)
+            if any(k in e_str for k in (
+                'NewConnectionError', 'ConnectionRefused',
+                'actively refused', 'Max retries', 'Failed to establish',
+            )):
+                print("[ChessCom] ✗ cancel_challenge: browser connection lost")
+            else:
+                print(f"[ChessCom] ✗ Error in cancel_challenge: {e}")
+                import traceback
+                traceback.print_exc()
             return False
 
     def detect_game_started(self):
@@ -3012,18 +3101,16 @@ class ChessComInterface:
         // Initialize the flag
         window.__boardChanged = false;
 
-        // Debounce timer to batch rapid changes
-        let debounceTimer = null;
-
-        // Create the observer
+        // Create the observer.
+        // NO debounce timer: MutationObserver callbacks fire synchronously
+        // with DOM mutations and are NOT subject to Chrome's timer throttling
+        // (IntensiveWakeUpThrottling, background-tab setTimeout slowdown, etc).
+        // A setTimeout debounce inside the callback IS throttled, adding a
+        // guaranteed ≥50 ms floor to every move detection in background tabs.
+        // The moves table fires one clean mutation per move (a new cell is
+        // appended), so batching is unnecessary.
         const observer = new MutationObserver(() => {
-            // Debounce: wait 50ms for all related mutations to complete
-            // Prevents duplicate triggers while maintaining responsiveness
-            clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(() => {
-                // Set global flag - Python polls this via execute_script
-                window.__boardChanged = true;
-            }, 50);
+            window.__boardChanged = true;
         });
 
         // Watch only the moves table - this fires exactly once per move played.
@@ -3662,7 +3749,11 @@ class ChessComInterface:
         # Use shared cache so the board-param round-trips already paid by the
         # monitor cycle (or by make_move_cdp) are not repeated here.
         is_flipped, board_size, _board_rect = self._get_cached_board_params()
-        variant_name = self.get_variant_name()
+        # Variant name is stable for the whole game; avoid the 1-2 extra
+        # execute_script calls (href + possibly title) on every hot-path call.
+        if self._variant_name_cache is None:
+            self._variant_name_cache = self.get_variant_name()
+        variant_name = self._variant_name_cache
         num_files = board_size.get('files', 8)
         num_ranks = board_size.get('ranks', 8)
 
