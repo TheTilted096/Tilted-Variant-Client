@@ -767,6 +767,11 @@ class VariantsClient:
                 move_display = UCIHandler.format_move_display(parsed_move)
                 print(f"[Move] {move_display}")
 
+                # Snapshot the opponent's last move (the most recent move
+                # on the board before ours) for disconnect-retry verification.
+                ml_parts = self.move_list.strip().split()
+                opp_last = ml_parts[-1] if ml_parts else None
+
                 # Store the move before executing it
                 self.move_list += user_input + " "
 
@@ -781,7 +786,7 @@ class VariantsClient:
                     gen = self._game_generation
                     threading.Thread(
                         target=self._verify_move_registered,
-                        args=(user_input, gen),
+                        args=(user_input, gen, opp_last),
                         daemon=True,
                     ).start()
                 else:
@@ -879,21 +884,34 @@ class VariantsClient:
 
     # ── Move verification ─────────────────────────────────────────────────────
 
-    def _verify_move_registered(self, uci_move, generation, max_retries=5):
+    def _verify_move_registered(self, uci_move, generation,
+                                opponent_last_move, max_retries=5):
         """Verify a move was registered by the server, retrying if necessary.
 
-        After making a move the turn should switch to the opponent.  If it is
-        still our turn after a brief delay the move was likely lost (e.g. due
-        to a disconnect/reconnect mid-move) and needs to be replayed.
+        Uses ``get_last_move()`` to read the official board state directly from
+        chess.com's DOM (not the internal move list).  If the DOM still shows
+        ``opponent_last_move`` as the most recent move, our move was lost
+        (e.g. due to a disconnect/reconnect) and needs to be replayed.
+
+        Premove edge-case: the opponent may respond so quickly (premove) that
+        by the time we check, the board already shows the *opponent's new*
+        response move and it is our turn again.  This is distinguished from
+        a lost move because ``get_last_move()`` will **not** equal
+        ``opponent_last_move`` — it will be the opponent's fresh reply.
 
         Args:
-            uci_move:     The UCI move string that was just played.
-            generation:   The ``_game_generation`` value captured when the move
-                          was initiated.  Used to abort if the game changed.
-            max_retries:  Maximum number of retry attempts.
+            uci_move:           The UCI move string that was just played.
+            generation:         The ``_game_generation`` value captured when the
+                                move was initiated.  Used to abort if the game
+                                changed.
+            opponent_last_move: The opponent's most recent move (from the DOM)
+                                that was on the board *before* we played.  If
+                                ``None`` (first move of the game) the check
+                                treats any non-None board move as confirmation.
+            max_retries:        Maximum number of retry attempts.
         """
-        _INITIAL_DELAY = 0.25   # seconds before first check
-        _RETRY_DELAY   = 0.50   # seconds between subsequent retries
+        _INITIAL_DELAY = 1.0   # seconds before first check (move exec ≈ 300 ms)
+        _RETRY_DELAY   = 1.0   # seconds between subsequent retries
 
         for attempt in range(max_retries):
             delay = _INITIAL_DELAY if attempt == 0 else _RETRY_DELAY
@@ -909,17 +927,25 @@ class VariantsClient:
                 if not game_state['in_game']:
                     return  # Game ended — nothing to verify.
 
-                color = game_state['color']
-                turn  = game_state['turn']
+                # Read the last move from chess.com's DOM (board highlights /
+                # move table), NOT the internal self.move_list.
+                board_last_move = self.chesscom_interface.get_last_move(
+                    verbose=False,
+                )
 
-                if color != turn:
-                    # Opponent's turn — our move was accepted.
+                if board_last_move != opponent_last_move:
+                    # The board shows a different move than the opponent's
+                    # previous one.  This means either:
+                    #   1. Our move registered (board shows our move).
+                    #   2. The opponent already pre-moved in response (board
+                    #      shows the opponent's *new* move, not the old one).
+                    # Both cases confirm our move went through.
                     if attempt > 0:
                         _bg_print(f"[Move Verify] ✓ Move {uci_move} confirmed "
                                   f"after {attempt} retry(ies)")
                     return
 
-                # Still our turn — the move was not registered.
+                # Board still shows the opponent's last move — ours was lost.
                 _bg_print(f"[Move Verify] Move {uci_move} not registered "
                           f"(attempt {attempt + 1}/{max_retries}), retrying...")
                 self.chesscom_interface.make_move(uci_move)
@@ -945,6 +971,10 @@ class VariantsClient:
         generation = self._game_generation
         # Freeze detection time at the point of triggering.
         detect_ms = self._detect_ms
+        # Snapshot the opponent's last move (the one that triggered us).
+        # Used by _verify_move_registered to detect whether our move was lost.
+        parts = self.move_list.strip().split()
+        opponent_last_move = parts[-1] if parts else None
 
         def on_best_move(uci_move, think_ms=0, relay_ms=0):
             if not uci_move:
@@ -979,7 +1009,8 @@ class VariantsClient:
             # Verify the move was actually registered by the server.
             # If a disconnect/reconnect happened mid-move the server may
             # never have received it; this will detect and retry.
-            self._verify_move_registered(uci_move, generation)
+            self._verify_move_registered(uci_move, generation,
+                                         opponent_last_move)
 
         self.engine_manager.request_move(self.move_list, on_best_move)
 
