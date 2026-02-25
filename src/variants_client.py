@@ -775,6 +775,15 @@ class VariantsClient:
 
                 if success:
                     print("[Success] Move executed!")
+                    # Verify the move registered in the background so the
+                    # terminal prompt returns immediately.  If a disconnect
+                    # occurred mid-move the verification loop will retry.
+                    gen = self._game_generation
+                    threading.Thread(
+                        target=self._verify_move_registered,
+                        args=(user_input, gen),
+                        daemon=True,
+                    ).start()
                 else:
                     print("[Error] Failed to execute move on chess.com")
                     print("[Help] Make sure you're in an active game on the board")
@@ -868,6 +877,59 @@ class VariantsClient:
         except Exception:
             pass
 
+    # ── Move verification ─────────────────────────────────────────────────────
+
+    def _verify_move_registered(self, uci_move, generation, max_retries=5):
+        """Verify a move was registered by the server, retrying if necessary.
+
+        After making a move the turn should switch to the opponent.  If it is
+        still our turn after a brief delay the move was likely lost (e.g. due
+        to a disconnect/reconnect mid-move) and needs to be replayed.
+
+        Args:
+            uci_move:     The UCI move string that was just played.
+            generation:   The ``_game_generation`` value captured when the move
+                          was initiated.  Used to abort if the game changed.
+            max_retries:  Maximum number of retry attempts.
+        """
+        _INITIAL_DELAY = 0.25   # seconds before first check
+        _RETRY_DELAY   = 0.50   # seconds between subsequent retries
+
+        for attempt in range(max_retries):
+            delay = _INITIAL_DELAY if attempt == 0 else _RETRY_DELAY
+            time.sleep(delay)
+
+            # Abort if the game changed while we were waiting.
+            if self._game_generation != generation:
+                return
+
+            try:
+                game_state = self.chesscom_interface.get_game_state()
+
+                if not game_state['in_game']:
+                    return  # Game ended — nothing to verify.
+
+                color = game_state['color']
+                turn  = game_state['turn']
+
+                if color != turn:
+                    # Opponent's turn — our move was accepted.
+                    if attempt > 0:
+                        _bg_print(f"[Move Verify] ✓ Move {uci_move} confirmed "
+                                  f"after {attempt} retry(ies)")
+                    return
+
+                # Still our turn — the move was not registered.
+                _bg_print(f"[Move Verify] Move {uci_move} not registered "
+                          f"(attempt {attempt + 1}/{max_retries}), retrying...")
+                self.chesscom_interface.make_move(uci_move)
+
+            except Exception as e:
+                _bg_print(f"[Move Verify] Error during verification: {e}")
+
+        _bg_print(f"[Move Verify] ⚠ Could not confirm move {uci_move} "
+                  f"after {max_retries} retries")
+
     # ── Engine integration ───────────────────────────────────────────────────
 
     def _trigger_engine_move(self):
@@ -913,6 +975,11 @@ class VariantsClient:
                     json.dump(list(self._timing_history), _tf)
             except Exception:
                 pass
+
+            # Verify the move was actually registered by the server.
+            # If a disconnect/reconnect happened mid-move the server may
+            # never have received it; this will detect and retry.
+            self._verify_move_registered(uci_move, generation)
 
         self.engine_manager.request_move(self.move_list, on_best_move)
 
