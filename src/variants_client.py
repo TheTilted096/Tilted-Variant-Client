@@ -811,7 +811,8 @@ class VariantsClient:
             # common form and is trivially reliable to detect.
             current_url = driver.current_url
             BAD_URL_FRAGMENTS = ('/membership', '/premium', '/upgrade',
-                                 '/subscription', '/pricing', '/other')
+                                 '/subscription', '/pricing', '/other',
+                                 '/variants/custom/game', '/home', '/play')
             is_promo = any(frag in current_url for frag in BAD_URL_FRAGMENTS)
 
             # ── Secondary: DOM overlay scan ───────────────────────────────────
@@ -851,7 +852,7 @@ class VariantsClient:
                 """) or False
 
             if is_promo:
-                _bg_print(f"[Client] ⚠ Membership promotion page detected "
+                _bg_print(f"[Client] ⚠ Unexpected page detected "
                           f"({current_url}) — navigating back to variants lobby...")
                 driver.get("https://www.chess.com/variants")
                 time.sleep(2.5)
