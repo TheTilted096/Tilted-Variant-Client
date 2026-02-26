@@ -2211,7 +2211,8 @@ class ChessComInterface:
 
                 if (text.includes('rematch') || ariaLabel.includes('rematch')) {
                     const rect = button.getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0) {
+                    // Exclude left sidebar (x < 250)
+                    if (rect.width > 0 && rect.height > 0 && rect.left > 250) {
                         rematchButton = button;
                         break;
                     }
@@ -2407,6 +2408,7 @@ class ChessComInterface:
             let exitButton = null;
 
             // Look for buttons with "exit" text
+            // Important: Ignore buttons in the left sidebar (x < 250)
             const allButtons = document.querySelectorAll('button, a');
             for (const button of allButtons) {
                 const text = button.textContent?.toLowerCase() || '';
@@ -2414,7 +2416,7 @@ class ChessComInterface:
 
                 if (text.includes('exit') || ariaLabel.includes('exit')) {
                     const rect = button.getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0) {
+                    if (rect.width > 0 && rect.height > 0 && rect.left > 250) {
                         exitButton = button;
                         break;
                     }
@@ -2484,7 +2486,8 @@ class ChessComInterface:
                                 let el = node.parentElement;
                                 while (el && el !== document.body) {
                                     const rect = el.getBoundingClientRect();
-                                    if (rect.width > 0 && rect.height > 0) {
+                                    // Exclude left sidebar (x < 250)
+                                    if (rect.width > 0 && rect.height > 0 && rect.left > 250) {
                                         return {
                                             found: true,
                                             x: rect.left + rect.width / 2,
@@ -3440,17 +3443,22 @@ class ChessComInterface:
                 }
             }
 
-            // If no X button found, fall back to backdrop (left of dialog)
+            // If no X button found, fall back to backdrop (left of dialog).
+            // Only target large dialogs (actual modals, not small sidebar
+            // elements that happen to match the class selectors), and clamp
+            // the click x-coordinate so it never lands on the left sidebar.
+            const SIDEBAR_RIGHT = 250;
             const dialogs = document.querySelectorAll(
                 '[class*="modal"], [class*="dialog"], [class*="popup"], [class*="game-over"]'
             );
             for (const dialog of dialogs) {
                 const rect = dialog.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0) {
+                if (rect.width >= 250 && rect.height >= 200) {
+                    const bx = Math.max(SIDEBAR_RIGHT + 10, rect.left - 60);
                     return {
                         found: true,
                         method: 'backdrop',
-                        x: Math.max(10, rect.left - 60),
+                        x: bx,
                         y: rect.top + rect.height / 2
                     };
                 }
