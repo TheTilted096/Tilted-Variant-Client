@@ -53,6 +53,8 @@ class VariantsClient:
         self.move_list = ""
         # Fallback game-over polling (monotonic timestamp of last check)
         self._last_game_over_poll = 0.0
+        # Fallback move polling (monotonic timestamp of last check)
+        self._last_move_fallback_poll = 0.0
         # Background monitoring thread
         self.monitor_thread = None
         self.monitor_thread_running = False
@@ -225,6 +227,25 @@ class VariantsClient:
                                   "fallback scan (observer missed it)")
                         self.handle_game_over()
 
+            # Fallback: the MutationObserver can miss a move if:
+            #   - the .moves-table DOM element was replaced (React re-render),
+            #     orphaning the observer on the old, detached element;
+            #   - a concurrent WebDriver call from the engine verification
+            #     thread caused an exception in handle_board_changed(), which
+            #     was caught and logged but still consumed the flag;
+            #   - any other transient failure.
+            # Mirror the game-over fallback: every ~2 s, when an engine is
+            # active and no observer event fired this cycle, compare the DOM
+            # move count against our internal list.
+            if (not board_changed
+                    and self.was_in_game
+                    and self._new_game_settled
+                    and self.engine_manager.process is not None):
+                now = time.monotonic()
+                if now - self._last_move_fallback_poll >= 2.0:
+                    self._last_move_fallback_poll = now
+                    self._check_for_missed_move()
+
             # Also periodically check for game start
             self.check_for_game_start()
 
@@ -240,6 +261,52 @@ class VariantsClient:
             # Only print non-session errors (session errors are expected on shutdown)
             if 'invalid session' not in str(e).lower():
                 print(f"[Debug] Error in process_console_events: {e}")
+
+    def _check_for_missed_move(self):
+        """Fallback: detect and recover from a missed move-observer event.
+
+        Compares the number of moves visible in chess.com's DOM against our
+        internal ``move_list``.  If the DOM is ahead (and it is our turn) the
+        MutationObserver missed the opponent's move — harvest it and trigger
+        the engine.
+
+        Also re-installs the MutationObserver if the ``.moves-table`` DOM
+        element may have been replaced (React re-render / SPA transition),
+        which would leave the old observer attached to a detached node.
+        """
+        try:
+            game_state = self.chesscom_interface.get_game_state()
+            if not game_state['in_game']:
+                return
+            color = game_state['color']
+            turn = game_state['turn']
+            if not color or not turn or color != turn:
+                return  # Not our turn — nothing to recover.
+
+            # Count moves the server/DOM knows about.
+            dom_count = self.chesscom_interface.driver.execute_script("""
+                const mt = document.querySelector('.moves-table');
+                if (!mt) return 0;
+                const cells = mt.querySelectorAll('.moves-table-cell.moves-move');
+                return Array.from(cells).filter(c => c.textContent.trim().length > 0).length;
+            """) or 0
+
+            our_count = len(self.move_list.strip().split()) if self.move_list.strip() else 0
+
+            if dom_count > our_count:
+                _bg_print(
+                    f"[Fallback] Missed move detected! DOM has {dom_count} "
+                    f"move(s), internal list has {our_count}. Recovering..."
+                )
+                # The observer may be dead — re-install it first so future
+                # moves are caught by the primary event-driven path.
+                self.chesscom_interface.setup_move_observer()
+                # Now handle the missed move normally.
+                self.handle_board_changed()
+
+        except Exception as e:
+            if 'invalid session' not in str(e).lower():
+                _bg_print(f"[Fallback] Error in missed-move check: {e}")
 
     def _is_game_over_dialog_visible(self):
         """Targeted check for the game-over modal dialog.
@@ -301,12 +368,19 @@ class VariantsClient:
                 move = self.chesscom_interface.get_last_move(verbose=False)
                 self._detect_ms = int((time.monotonic() - t_detect_start) * 1000)
                 if move:
+                    # Guard: skip if this move was already appended (can
+                    # happen when the fallback poll fires right after the
+                    # observer, or due to duplicate MutationObserver events).
+                    parts = self.move_list.strip().split()
+                    if parts and parts[-1] == move:
+                        return
                     self.move_list += move + " "
                 # If the engine is running, ask it for the reply.
                 if self.engine_manager.process is not None:
                     self._trigger_engine_move()
-        except Exception:
-            pass
+        except Exception as e:
+            if 'invalid session' not in str(e).lower():
+                _bg_print(f"[Board Change] Error handling board change: {e}")
 
     def handle_game_over(self):
         """Handle game over event from MutationObserver."""
@@ -466,10 +540,11 @@ class VariantsClient:
                 _bg_print("=" * 60)
                 self.was_in_game = True
                 self.move_list = ""
-                # Push the fallback game-over poll into the future so it
-                # cannot fire during the page transition (stale elements from
-                # the previous game may still be in the DOM for a few seconds).
+                # Push the fallback polls into the future so they cannot
+                # fire during the page transition (stale elements from the
+                # previous game may still be in the DOM for a few seconds).
                 self._last_game_over_poll = time.monotonic()
+                self._last_move_fallback_poll = time.monotonic()
                 # Discard any stale board-orientation/size cache from the
                 # previous game so the first move of the new game re-detects
                 # them correctly.
