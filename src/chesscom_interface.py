@@ -30,6 +30,11 @@ class ChessComInterface:
         # 1-2 execute_script calls (href + title) from every get_last_move()
         # invocation.  Cleared alongside board params when a new game starts.
         self._variant_name_cache = None   # str | None
+        # Cached right-edge of the left sidebar (CSS px).  Measured once
+        # from the DOM; used as an exclusion zone for button searches so
+        # that sidebar nav links (Play, Puzzles, Other …) are never
+        # accidentally matched.  None = not yet measured.
+        self._sidebar_right_cache = None   # float | None
 
     def focus_browser(self):
         """Bring the browser window to focus."""
@@ -85,6 +90,47 @@ class ChessComInterface:
         self._board_params_cache = None
         self._board_params_time  = 0.0
         self._variant_name_cache = None
+
+    def _get_sidebar_right(self):
+        """Return the right-edge x-coordinate of the left sidebar (CSS px).
+
+        Measured from the DOM on first call and cached for the session.
+        The sidebar width is fixed for a given viewport / zoom level and
+        doesn't change across games, so a single measurement suffices.
+
+        Falls back to 0 (no exclusion zone) if the sidebar element
+        cannot be found — this is conservative because the hardcoded
+        fallback is only active when the page layout is unrecognisable,
+        and a zero threshold never rejects a real button.
+        """
+        if self._sidebar_right_cache is not None:
+            return self._sidebar_right_cache
+        try:
+            right = self.driver.execute_script("""
+                // Chess.com's left sidebar uses a <nav> with id 'sb'.
+                // Fall back to any narrow, tall, left-anchored <nav>.
+                let nav = document.getElementById('sb');
+                if (!nav) {
+                    for (const el of document.querySelectorAll(
+                            'nav, [class*="sidebar"], [class*="side-nav"]')) {
+                        const r = el.getBoundingClientRect();
+                        if (r.left < 10 && r.height > window.innerHeight * 0.4
+                                && r.width > 0 && r.width < 400) {
+                            nav = el;
+                            break;
+                        }
+                    }
+                }
+                if (nav) {
+                    const r = nav.getBoundingClientRect();
+                    if (r.width > 0 && r.width < 400) return r.right;
+                }
+                return 0;
+            """) or 0
+            self._sidebar_right_cache = float(right)
+        except Exception:
+            self._sidebar_right_cache = 0.0
+        return self._sidebar_right_cache
 
     def _coords_for_square_py(self, square, is_flipped, board_size, board_rect):
         """Return {'x': float, 'y': float} for square using pure Python arithmetic.
@@ -2193,6 +2239,7 @@ class ChessComInterface:
 
         try:
             js_script = """
+            const SIDEBAR_RIGHT = arguments[0];
             // Find rematch button - appears after game ends
             const rematchSelectors = [
                 'button[aria-label*="Rematch"]',
@@ -2211,8 +2258,7 @@ class ChessComInterface:
 
                 if (text.includes('rematch') || ariaLabel.includes('rematch')) {
                     const rect = button.getBoundingClientRect();
-                    // Exclude left sidebar (x < 250)
-                    if (rect.width > 0 && rect.height > 0 && rect.left > 250) {
+                    if (rect.width > 0 && rect.height > 0 && rect.left > SIDEBAR_RIGHT) {
                         rematchButton = button;
                         break;
                     }
@@ -2233,7 +2279,7 @@ class ChessComInterface:
             };
             """
 
-            result = self.driver.execute_script(js_script)
+            result = self.driver.execute_script(js_script, self._get_sidebar_right())
 
             if result.get('found'):
                 x = result['x']
@@ -2291,6 +2337,7 @@ class ChessComInterface:
 
         try:
             js_script = """
+            const SIDEBAR_RIGHT = arguments[0];
             // Find play again button - appears after game ends
             const playAgainSelectors = [
                 'button[aria-label*="Play"]',
@@ -2316,9 +2363,9 @@ class ChessComInterface:
                 if (hasPlayAgain || hasPlay) {
                     const rect = button.getBoundingClientRect();
 
-                    // Ignore buttons in the left sidebar (typically x < 250px)
+                    // Ignore buttons in the left sidebar
                     // We want the Play button in the main game area
-                    if (rect.width > 0 && rect.height > 0 && rect.left > 250) {
+                    if (rect.width > 0 && rect.height > 0 && rect.left > SIDEBAR_RIGHT) {
                         playAgainButton = button;
                         break;
                     }
@@ -2339,7 +2386,7 @@ class ChessComInterface:
             };
             """
 
-            result = self.driver.execute_script(js_script)
+            result = self.driver.execute_script(js_script, self._get_sidebar_right())
 
             if result.get('found'):
                 x = result['x']
@@ -2397,6 +2444,7 @@ class ChessComInterface:
 
         try:
             js_script = """
+            const SIDEBAR_RIGHT = arguments[0];
             // Find exit button - appears after game ends
             const exitSelectors = [
                 'button[aria-label*="Exit"]',
@@ -2408,7 +2456,7 @@ class ChessComInterface:
             let exitButton = null;
 
             // Look for buttons with "exit" text
-            // Important: Ignore buttons in the left sidebar (x < 250)
+            // Ignore buttons in the left sidebar
             const allButtons = document.querySelectorAll('button, a');
             for (const button of allButtons) {
                 const text = button.textContent?.toLowerCase() || '';
@@ -2416,7 +2464,7 @@ class ChessComInterface:
 
                 if (text.includes('exit') || ariaLabel.includes('exit')) {
                     const rect = button.getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0 && rect.left > 250) {
+                    if (rect.width > 0 && rect.height > 0 && rect.left > SIDEBAR_RIGHT) {
                         exitButton = button;
                         break;
                     }
@@ -2437,7 +2485,7 @@ class ChessComInterface:
             };
             """
 
-            result = self.driver.execute_script(js_script)
+            result = self.driver.execute_script(js_script, self._get_sidebar_right())
 
             if result.get('found'):
                 x = result['x']
@@ -2474,7 +2522,9 @@ class ChessComInterface:
                 print("[ChessCom] ✓ Exit button clicked")
 
                 # --- Click the Lobby tab ---
+                # Exclude the left sidebar to avoid clicking a nav link.
                 lobby_result = self.driver.execute_script("""
+                    const SIDEBAR_RIGHT = arguments[0];
                     function findTabByLabel(label) {
                         const re = new RegExp('^' + label + '$', 'i');
                         const walker = document.createTreeWalker(
@@ -2486,8 +2536,7 @@ class ChessComInterface:
                                 let el = node.parentElement;
                                 while (el && el !== document.body) {
                                     const rect = el.getBoundingClientRect();
-                                    // Exclude left sidebar (x < 250)
-                                    if (rect.width > 0 && rect.height > 0 && rect.left > 250) {
+                                    if (rect.width > 0 && rect.height > 0 && rect.left > SIDEBAR_RIGHT) {
                                         return {
                                             found: true,
                                             x: rect.left + rect.width / 2,
@@ -2501,7 +2550,7 @@ class ChessComInterface:
                         return { found: false };
                     }
                     return findTabByLabel('Lobby');
-                """)
+                """, self._get_sidebar_right())
 
                 if not lobby_result.get('found'):
                     print("[ChessCom] ✗ Lobby tab not found after exit")
@@ -3408,6 +3457,7 @@ class ChessComInterface:
 
             # --- Strategies 2 & 3: Find the close/X button, then CDP-click it ---
             js_script = """
+            const SIDEBAR_RIGHT = arguments[0];
             // Candidates: explicit close/dismiss buttons and aria-labelled buttons
             const closeSelectors = [
                 '[aria-label="Close"]',
@@ -3447,7 +3497,6 @@ class ChessComInterface:
             // Only target large dialogs (actual modals, not small sidebar
             // elements that happen to match the class selectors), and clamp
             // the click x-coordinate so it never lands on the left sidebar.
-            const SIDEBAR_RIGHT = 250;
             const dialogs = document.querySelectorAll(
                 '[class*="modal"], [class*="dialog"], [class*="popup"], [class*="game-over"]'
             );
@@ -3467,7 +3516,7 @@ class ChessComInterface:
             return { found: false };
             """
 
-            result = self.driver.execute_script(js_script)
+            result = self.driver.execute_script(js_script, self._get_sidebar_right())
 
             if result.get('found'):
                 x = result['x']
