@@ -638,24 +638,47 @@ class VariantsClient:
         _bg_print(f"[Recovery] Attempting to rejoin game "
                   f"#{saved_game_number}...")
 
-        # Give chess.com a moment to redirect to the active game page.
-        # Poll get_game_state() for up to ~5 seconds; chess.com typically
-        # restores the session within a second or two of page load.
+        # After reconnect() Edge opens chess.com/variants.  If a game
+        # is still active chess.com redirects to the game board within
+        # a second or two; if the game ended (timeout, resignation)
+        # the page stays on /variants.  A brief wait + URL check is
+        # the fastest and most reliable way to distinguish the two.
+        time.sleep(2.0)
+
+        try:
+            current_url = self.chesscom_interface.driver.current_url
+        except Exception:
+            current_url = ''
+
+        on_lobby = (
+            current_url.rstrip('/').endswith('/variants')
+            or '/variants?' in current_url
+        )
+
+        if on_lobby:
+            _bg_print("[Recovery] Still on variants lobby "
+                      "— game has ended")
+            self.was_in_game = False
+            self.current_game_number = None
+            self.move_list = ""
+            self._new_game_settled = True
+            if self.loop_running:
+                self._loop_restart_required = True
+                _bg_print("[Recovery] Signalling loop to restart "
+                          "challenge phase...")
+            return
+
+        # We were redirected away from the lobby — verify we're
+        # actually on a game page with valid player elements.
         game_state = None
-        for attempt in range(5):
-            time.sleep(1.0)
-            try:
-                game_state = self.chesscom_interface.get_game_state()
-                if game_state.get('in_game'):
-                    break
-            except Exception:
-                pass
+        try:
+            game_state = self.chesscom_interface.get_game_state()
+        except Exception:
+            pass
 
         if not game_state or not game_state.get('in_game'):
-            # Game is no longer in progress (timed out, opponent left,
-            # etc.) — treat like a lobby crash.
-            _bg_print("[Recovery] Game is no longer in progress "
-                      "— resetting state")
+            _bg_print("[Recovery] Redirected but not on a game page "
+                      f"({current_url}) — resetting state")
             self.was_in_game = False
             self.current_game_number = None
             self.move_list = ""
@@ -679,11 +702,11 @@ class VariantsClient:
         self.chesscom_interface.setup_game_over_observer()
         self.chesscom_interface.setup_move_observer()
 
-        # Check whether the game already ended during the recovery
-        # window (e.g. we timed out on chess.com's clock).  The board
-        # and playerbox elements persist after game-over, so
-        # get_game_state() still reports in_game=True — we must look
-        # for the result dialog explicitly.
+        # The game page is loaded but the game may have already ended
+        # (e.g. timed out on chess.com's clock during recovery).  The
+        # board and playerbox elements persist after game-over so
+        # get_game_state() still reports in_game=True — check for the
+        # result dialog explicitly.
         if self._is_game_over_dialog_visible():
             _bg_print("[Recovery] Game ended during recovery "
                       "(timeout / resignation) — handling as game over")
