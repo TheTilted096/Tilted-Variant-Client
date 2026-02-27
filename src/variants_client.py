@@ -189,6 +189,13 @@ class VariantsClient:
                     or 'session not created' in err_str
                     or 'chrome not reachable' in err_str
                     or 'target window already closed' in err_str
+                    # Low-level socket / connection errors (Ctrl+W,
+                    # Cold Turkey kill, process crash, etc.)
+                    or 'connection aborted' in err_str
+                    or 'connection refused' in err_str
+                    or 'forcibly closed' in err_str
+                    or 'remotedisconnected' in err_str
+                    or 'broken pipe' in err_str
                 )
                 if is_session_dead:
                     self._session_fail_count += 1
@@ -290,7 +297,12 @@ class VariantsClient:
             # the consecutive-failure counter can trigger recovery.
             if ('invalid session' in err_str
                     or 'no such window' in err_str
-                    or 'chrome not reachable' in err_str):
+                    or 'chrome not reachable' in err_str
+                    or 'connection aborted' in err_str
+                    or 'connection refused' in err_str
+                    or 'forcibly closed' in err_str
+                    or 'remotedisconnected' in err_str
+                    or 'broken pipe' in err_str):
                 raise
             print(f"[Debug] Error in process_console_events: {e}")
 
