@@ -638,11 +638,12 @@ class VariantsClient:
         _bg_print(f"[Recovery] Attempting to rejoin game "
                   f"#{saved_game_number}...")
 
-        # Give chess.com time to redirect to the active game page.
-        # Poll get_game_state() for up to ~12 seconds.
+        # Give chess.com a moment to redirect to the active game page.
+        # Poll get_game_state() for up to ~5 seconds; chess.com typically
+        # restores the session within a second or two of page load.
         game_state = None
-        for attempt in range(10):
-            time.sleep(1.5 if attempt == 0 else 1.0)
+        for attempt in range(5):
+            time.sleep(1.0)
             try:
                 game_state = self.chesscom_interface.get_game_state()
                 if game_state.get('in_game'):
@@ -665,17 +666,32 @@ class VariantsClient:
                           "challenge phase...")
             return
 
-        # Game is still active — restore tracking state.
-        _bg_print(f"[Recovery] ✓ Game #{saved_game_number} still "
-                  f"in progress")
+        # Game page is showing — restore tracking state so that
+        # handle_game_over() and the monitor loop's guards work.
+        # Deliberately do NOT reset _game_start_time: the original
+        # value from when the game was first detected lets
+        # handle_game_over() pass its 3-second minimum-age guard.
         self.was_in_game = True
         self.current_game_number = saved_game_number
         self._new_game_settled = True
-        self._game_start_time = time.monotonic()
 
         # Re-install observers now that we're on the game page.
         self.chesscom_interface.setup_game_over_observer()
         self.chesscom_interface.setup_move_observer()
+
+        # Check whether the game already ended during the recovery
+        # window (e.g. we timed out on chess.com's clock).  The board
+        # and playerbox elements persist after game-over, so
+        # get_game_state() still reports in_game=True — we must look
+        # for the result dialog explicitly.
+        if self._is_game_over_dialog_visible():
+            _bg_print("[Recovery] Game ended during recovery "
+                      "(timeout / resignation) — handling as game over")
+            self.handle_game_over()
+            return
+
+        _bg_print(f"[Recovery] ✓ Game #{saved_game_number} still "
+                  f"in progress")
 
         color = game_state.get('color')
         turn = game_state.get('turn')
