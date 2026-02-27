@@ -535,39 +535,247 @@ class VariantsClient:
         Returns True if recovery succeeded, False otherwise.
         Called from the background monitor loop when consecutive
         WebDriver failures exceed the threshold.
+
+        If a game was in progress when the browser died, the method
+        preserves the pre-crash state (move list, game number) and
+        attempts to reconcile with the live board after reconnection.
+        If the browser was in the lobby / between games, it resets
+        cleanly and signals the automated loop (if running) to
+        restart its challenge phase.
         """
         _bg_print("[Recovery] Browser session lost — attempting recovery...")
         try:
-            # Stop the engine (it can't do anything without a browser)
+            # Immediately invalidate in-flight engine callbacks to prevent
+            # move_list corruption from a late callback firing during
+            # recovery.  The on_best_move closure captures the generation
+            # at request time; bumping it here ensures a stale callback
+            # sees a mismatch and discards its result.
+            self._game_generation += 1
+
+            # Stop the engine — it can't execute moves without a browser,
+            # and the generation bump above already guards against stale
+            # callbacks from a just-finished search.
             if self.engine_manager.process is not None:
                 _bg_print("[Recovery] Stopping engine...")
                 self.engine_manager.stop()
 
-            # Ask the launcher to kill old process and start fresh
+            # Snapshot the pre-crash game state before touching anything.
+            was_mid_game = self.was_in_game
+            saved_move_list = self.move_list
+            saved_game_number = self.current_game_number
+
+            # Ask the launcher to kill old Edge and start fresh.
+            # Edge relaunches at chess.com/variants; if a game is active
+            # chess.com typically auto-redirects to the game board.
             self.driver = self.browser_launcher.reconnect()
             self.chesscom_interface.driver = self.driver
 
-            # Invalidate all cached state — it belonged to the dead session
+            # Invalidate all cached state — it belonged to the dead session.
             self.chesscom_interface.invalidate_board_params_cache()
             self.chesscom_interface._sidebar_right_cache = None
-
-            # Reset game state — any in-progress game is lost
-            self.was_in_game = False
-            self.current_game_number = None
-            self.move_list = ""
-            self._new_game_settled = True
             self._session_fail_count = 0
 
-            # Re-install MutationObservers on the fresh page
+            # Install baseline observers on whatever page loaded.
             self.chesscom_interface.setup_game_over_observer()
             self.chesscom_interface.setup_move_observer()
 
             _bg_print("[Recovery] ✓ Browser session restored")
-            _bg_print("[Recovery]   Navigate to a variant game to continue.")
+
+            if was_mid_game and saved_game_number:
+                self._reconcile_after_crash(saved_move_list,
+                                            saved_game_number)
+            else:
+                # Lobby / between-games crash — simple reset.
+                _bg_print("[Recovery] Was not in a game — resetting state")
+                self.was_in_game = False
+                self.current_game_number = None
+                self.move_list = ""
+                self._new_game_settled = True
+                if self.loop_running:
+                    self._loop_restart_required = True
+                    _bg_print("[Recovery] Signalling loop to restart "
+                              "challenge phase...")
+
             return True
         except Exception as e:
             _bg_print(f"[Recovery] ✗ Recovery failed: {e}")
             return False
+
+    def _reconcile_after_crash(self, saved_move_list, saved_game_number):
+        """Reconcile game state after recovering from a browser crash.
+
+        Compares our internal move list against the actual board state
+        (via the DOM) and takes the appropriate corrective action:
+
+        - **Their turn**: restore the saved move list and wait normally.
+        - **Our turn, board matches**: crash was before our move — restart
+          the engine and search.
+        - **Our turn, mismatch, our move on top**: our move was either not
+          registered (replay it) or went through and the opponent replied
+          (append their reply, then search).
+        - **Our turn, mismatch, opponent move on top**: opponent moved
+          while we were down — append and search.
+        - **Game over**: the game ended during the crash window — reset
+          state and signal a loop restart.
+
+        Args:
+            saved_move_list:   Space-separated UCI moves recorded before
+                               the crash.
+            saved_game_number: Game number that was in progress.
+        """
+        _bg_print(f"[Recovery] Attempting to rejoin game "
+                  f"#{saved_game_number}...")
+
+        # Give chess.com time to redirect to the active game page.
+        # Poll get_game_state() for up to ~12 seconds.
+        game_state = None
+        for attempt in range(10):
+            time.sleep(1.5 if attempt == 0 else 1.0)
+            try:
+                game_state = self.chesscom_interface.get_game_state()
+                if game_state.get('in_game'):
+                    break
+            except Exception:
+                pass
+
+        if not game_state or not game_state.get('in_game'):
+            # Game is no longer in progress (timed out, opponent left,
+            # etc.) — treat like a lobby crash.
+            _bg_print("[Recovery] Game is no longer in progress "
+                      "— resetting state")
+            self.was_in_game = False
+            self.current_game_number = None
+            self.move_list = ""
+            self._new_game_settled = True
+            if self.loop_running:
+                self._loop_restart_required = True
+                _bg_print("[Recovery] Signalling loop to restart "
+                          "challenge phase...")
+            return
+
+        # Game is still active — restore tracking state.
+        _bg_print(f"[Recovery] ✓ Game #{saved_game_number} still "
+                  f"in progress")
+        self.was_in_game = True
+        self.current_game_number = saved_game_number
+        self._new_game_settled = True
+        self._game_start_time = time.monotonic()
+
+        # Re-install observers now that we're on the game page.
+        self.chesscom_interface.setup_game_over_observer()
+        self.chesscom_interface.setup_move_observer()
+
+        color = game_state.get('color')
+        turn = game_state.get('turn')
+        if not color or not turn:
+            _bg_print("[Recovery] Could not determine color/turn "
+                      "— restoring move list and waiting")
+            self.move_list = saved_move_list
+            return
+
+        # Source of truth: last move shown on the board.
+        dom_last_move = self.chesscom_interface.get_last_move(
+            verbose=False)
+        # Our last recorded move.
+        parts = (saved_move_list.strip().split()
+                 if saved_move_list.strip() else [])
+        internal_last_move = parts[-1] if parts else None
+
+        _bg_print(f"[Recovery] Color: {color} | Turn: {turn}")
+        _bg_print(f"[Recovery] DOM last move: {dom_last_move} | "
+                  f"Internal last move: {internal_last_move}")
+
+        # ── THEIR TURN ────────────────────────────────────────────────
+        if color != turn:
+            _bg_print("[Recovery] It is the opponent's turn "
+                      "— waiting normally")
+            self.move_list = saved_move_list
+            return
+
+        # ── OUR TURN ─────────────────────────────────────────────────
+        _bg_print("[Recovery] It is our turn — reconciling...")
+
+        # Edge case: very start of the game, no moves at all.
+        if not parts and not dom_last_move:
+            _bg_print("[Recovery] Empty board — triggering engine "
+                      "for first move")
+            self.move_list = ""
+            self._restart_engine_and_search(color)
+            return
+
+        # CASE A: board agrees with our records — crash was before our
+        # move.  Just restart the engine and search.
+        if dom_last_move == internal_last_move:
+            _bg_print("[Recovery] Board matches internal records "
+                      "— crash was before our move")
+            self.move_list = saved_move_list
+            self._restart_engine_and_search(color)
+            return
+
+        # CASE B: mismatch — figure out whose move is on top of our
+        # list.  White's moves sit at even indices (0, 2, 4, …); Black's
+        # at odd indices (1, 3, 5, …).
+        if color == 'white':
+            last_is_ours = (len(parts) % 2 == 1)
+        else:
+            last_is_ours = (len(parts) % 2 == 0)
+
+        if last_is_ours:
+            # Our move is on top of the saved move list.
+            # Did it reach the server?
+            second_to_last = parts[-2] if len(parts) >= 2 else None
+
+            if dom_last_move == second_to_last:
+                # Board still shows the opponent's previous move — ours
+                # never registered.  Replay the same move.
+                our_failed_move = parts[-1]
+                _bg_print(f"[Recovery] Our move {our_failed_move} was "
+                          f"not registered — replaying it")
+                self.move_list = saved_move_list
+                success = self.chesscom_interface.make_move(
+                    our_failed_move)
+                if success:
+                    _bg_print(f"[Recovery] ✓ Replayed {our_failed_move}")
+                else:
+                    _bg_print(f"[Recovery] ✗ Failed to replay "
+                              f"{our_failed_move}")
+            else:
+                # Board shows a new move — ours went through and the
+                # opponent has already replied.
+                _bg_print(f"[Recovery] Our move went through, opponent "
+                          f"replied with {dom_last_move}")
+                self.move_list = saved_move_list + dom_last_move + " "
+                self._restart_engine_and_search(color)
+        else:
+            # Opponent's move is on top of our list, but the board shows
+            # something different — they moved while we were down.
+            _bg_print(f"[Recovery] Opponent moved while we were "
+                      f"down: {dom_last_move}")
+            self.move_list = saved_move_list + dom_last_move + " "
+            self._restart_engine_and_search(color)
+
+    def _restart_engine_and_search(self, color):
+        """Restart the engine for the current game and trigger a search.
+
+        Helper used by _reconcile_after_crash when it determines the
+        engine needs to produce a move for the current position.
+
+        Args:
+            color: 'white' or 'black' — which side the engine plays.
+        """
+        if not self.engine_manager.is_configured:
+            _bg_print("[Recovery] No engine configured "
+                      "— waiting for manual move")
+            return
+        variant = self.chesscom_interface.get_variant_name() or 'chess'
+        _bg_print(f"[Recovery] Starting engine for variant: {variant}")
+        ok = self.engine_manager.start(variant, color)
+        if ok:
+            _bg_print("[Recovery] ✓ Engine ready — triggering search")
+            self._trigger_engine_move()
+        else:
+            _bg_print("[Recovery] ✗ Failed to start engine "
+                      "— waiting for manual move")
 
     def check_for_game_start(self):
         """
