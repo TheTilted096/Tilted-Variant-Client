@@ -96,6 +96,10 @@ class VariantsClient:
         self._timing_file = os.path.join(
             tempfile.gettempdir(), 'tilted_timing.json'
         )
+        # Session-crash detection: count consecutive WebDriver failures
+        # in the monitor loop.  After a threshold, attempt recovery.
+        self._session_fail_count = 0
+        self._SESSION_FAIL_THRESHOLD = 5  # trigger recovery after 5 consecutive failures
 
     def start(self):
         """Start the variants client."""
@@ -173,11 +177,34 @@ class VariantsClient:
         while self.monitor_thread_running and self.running:
             try:
                 self.process_console_events()
+                # Reset failure counter on success
+                self._session_fail_count = 0
                 time.sleep(self.monitor_interval)
             except Exception as e:
-                print(f"[Monitor] Error in background loop: {e}")
-                import traceback
-                traceback.print_exc()
+                err_str = str(e).lower()
+                is_session_dead = (
+                    'invalid session' in err_str
+                    or 'no such window' in err_str
+                    or 'unable to connect' in err_str
+                    or 'session not created' in err_str
+                    or 'chrome not reachable' in err_str
+                    or 'target window already closed' in err_str
+                )
+                if is_session_dead:
+                    self._session_fail_count += 1
+                    if self._session_fail_count >= self._SESSION_FAIL_THRESHOLD:
+                        if self._attempt_session_recovery():
+                            continue  # recovered — resume monitoring
+                        else:
+                            # Back off before retrying recovery
+                            time.sleep(10)
+                    else:
+                        # Brief pause before next attempt
+                        time.sleep(0.5)
+                else:
+                    print(f"[Monitor] Error in background loop: {e}")
+                    import traceback
+                    traceback.print_exc()
 
     def process_console_events(self):
         """
@@ -258,9 +285,14 @@ class VariantsClient:
                     self._check_for_promo_banner()
 
         except Exception as e:
-            # Only print non-session errors (session errors are expected on shutdown)
-            if 'invalid session' not in str(e).lower():
-                print(f"[Debug] Error in process_console_events: {e}")
+            err_str = str(e).lower()
+            # Let session-death errors propagate to the monitor loop so
+            # the consecutive-failure counter can trigger recovery.
+            if ('invalid session' in err_str
+                    or 'no such window' in err_str
+                    or 'chrome not reachable' in err_str):
+                raise
+            print(f"[Debug] Error in process_console_events: {e}")
 
     def _check_for_missed_move(self):
         """Fallback: detect and recover from a missed move-observer event.
@@ -496,6 +528,46 @@ class VariantsClient:
             self.monitor_thread_running = False
             self.monitor_thread.join(timeout=2.0)  # Wait up to 2 seconds
             self.monitor_thread = None
+
+    def _attempt_session_recovery(self):
+        """Try to relaunch Edge and reconnect after a browser crash.
+
+        Returns True if recovery succeeded, False otherwise.
+        Called from the background monitor loop when consecutive
+        WebDriver failures exceed the threshold.
+        """
+        _bg_print("[Recovery] Browser session lost — attempting recovery...")
+        try:
+            # Stop the engine (it can't do anything without a browser)
+            if self.engine_manager.process is not None:
+                _bg_print("[Recovery] Stopping engine...")
+                self.engine_manager.stop()
+
+            # Ask the launcher to kill old process and start fresh
+            self.driver = self.browser_launcher.reconnect()
+            self.chesscom_interface.driver = self.driver
+
+            # Invalidate all cached state — it belonged to the dead session
+            self.chesscom_interface.invalidate_board_params_cache()
+            self.chesscom_interface._sidebar_right_cache = None
+
+            # Reset game state — any in-progress game is lost
+            self.was_in_game = False
+            self.current_game_number = None
+            self.move_list = ""
+            self._new_game_settled = True
+            self._session_fail_count = 0
+
+            # Re-install MutationObservers on the fresh page
+            self.chesscom_interface.setup_game_over_observer()
+            self.chesscom_interface.setup_move_observer()
+
+            _bg_print("[Recovery] ✓ Browser session restored")
+            _bg_print("[Recovery]   Navigate to a variant game to continue.")
+            return True
+        except Exception as e:
+            _bg_print(f"[Recovery] ✗ Recovery failed: {e}")
+            return False
 
     def check_for_game_start(self):
         """

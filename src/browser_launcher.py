@@ -6,6 +6,7 @@ import sys
 from selenium import webdriver
 from selenium.webdriver.edge.service import Service
 from selenium.webdriver.edge.options import Options
+from selenium.common.exceptions import WebDriverException
 
 
 class BrowserLauncher:
@@ -174,6 +175,43 @@ class BrowserLauncher:
         self.launch_edge_process()
 
         # Then, connect Selenium to it
+        return self.connect_to_edge()
+
+    def is_session_alive(self):
+        """Return True if the WebDriver session is still responsive."""
+        if not self.driver:
+            return False
+        try:
+            self.driver.title  # lightweight round-trip
+            return True
+        except WebDriverException:
+            return False
+
+    def reconnect(self):
+        """Relaunch Edge and reconnect Selenium after a crash.
+
+        Returns the new WebDriver instance, or raises on failure.
+        """
+        print("[Browser] Session dead — attempting to relaunch Edge...")
+
+        # Dispose of the stale driver handle (ignore errors; it's dead)
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+
+        # Kill any lingering Edge process from the previous session
+        if self.edge_process:
+            try:
+                self.edge_process.kill()
+            except Exception:
+                pass
+            self.edge_process = None
+
+        # Relaunch and reconnect
+        self.launch_edge_process()
         return self.connect_to_edge()
 
     def navigate_to_chesscom_variants(self):
