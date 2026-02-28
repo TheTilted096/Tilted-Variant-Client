@@ -36,6 +36,9 @@ _SESSION_DEATH_KEYWORDS = (
     # the middle of closing / navigating — treated as session-death so the
     # recovery path handles it instead of dumping a stack trace.
     'waitforpendingnavigations',
+    # urllib3 / requests connection-pool exhaustion — the WebDriver HTTP
+    # endpoint is gone (browser killed, port closed).
+    'max retries exceeded',
 )
 
 

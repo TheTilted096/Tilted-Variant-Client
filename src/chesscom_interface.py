@@ -13,7 +13,7 @@ _SESSION_DEATH_KEYWORDS = (
     'connection aborted', 'connection refused', 'forcibly closed',
     'remotedisconnected', 'broken pipe', 'session not created',
     'target window already closed', 'unable to connect',
-    'waitforpendingnavigations',
+    'waitforpendingnavigations', 'max retries exceeded',
 )
 
 
