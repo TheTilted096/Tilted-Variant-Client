@@ -570,12 +570,18 @@ class VariantsClient:
             # sees a mismatch and discards its result.
             self._game_generation += 1
 
-            # Stop the engine — it can't execute moves without a browser,
-            # and the generation bump above already guards against stale
-            # callbacks from a just-finished search.
-            if self.engine_manager.process is not None:
-                _bg_print("[Recovery] Stopping engine...")
-                self.engine_manager.stop()
+            # If the engine is mid-search, send UCI "stop" so it returns
+            # bestmove immediately.  The stale callback will be discarded
+            # by the generation check, and _searching is cleared, allowing
+            # the recovery path to issue a new search right away.
+            self.engine_manager.stop_search()
+
+            # The engine process is independent of the browser — leave it
+            # running.  The generation bump above already invalidates any
+            # in-flight callback, so a late bestmove will be safely
+            # discarded.  After recovery, _reconcile_after_crash() will
+            # either send a new position to the existing engine or, if
+            # the game ended, the normal game-over handler will stop it.
 
             # Snapshot the pre-crash game state before touching anything.
             was_mid_game = self.was_in_game
@@ -812,7 +818,12 @@ class VariantsClient:
             self._restart_engine_and_search(color)
 
     def _restart_engine_and_search(self, color):
-        """Restart the engine for the current game and trigger a search.
+        """Resume or restart the engine and trigger a search.
+
+        If the engine process is still alive (e.g. after a browser crash
+        that left the engine untouched), it is reused — just the color is
+        updated and a new search is issued.  Only when the engine is not
+        running at all is a full start() performed.
 
         Helper used by _reconcile_after_crash when it determines the
         engine needs to produce a move for the current position.
@@ -824,6 +835,17 @@ class VariantsClient:
             _bg_print("[Recovery] No engine configured "
                       "— waiting for manual move")
             return
+
+        if self.engine_manager.process is not None:
+            # Engine is still running — just update the color (in case
+            # a new game started with swapped sides) and search.
+            self.engine_manager.engine_color = color
+            _bg_print("[Recovery] Engine still running — triggering search")
+            self._trigger_engine_move()
+            return
+
+        # Engine was stopped (game-over handler, manual stop, etc.)
+        # — do a full start.
         variant = self.chesscom_interface.get_variant_name() or 'chess'
         _bg_print(f"[Recovery] Starting engine for variant: {variant}")
         ok = self.engine_manager.start(variant, color)

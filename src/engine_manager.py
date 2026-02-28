@@ -251,6 +251,23 @@ class EngineManager:
 
         return True
 
+    def stop_search(self):
+        """Send UCI ``stop`` to halt an in-progress search.
+
+        The engine will immediately reply with ``bestmove``; the
+        existing _search_worker thread will read it, clear _searching,
+        and invoke the callback (which will be discarded if the
+        generation has been bumped).
+
+        Safe to call even when no search is in progress.
+        """
+        if self.process is None or not self._searching:
+            return
+        try:
+            self._send("stop\n")
+        except Exception:
+            pass
+
     def stop(self):
         """Terminate the engine process immediately.
 
