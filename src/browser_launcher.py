@@ -9,13 +9,20 @@ from selenium.webdriver.edge.service import Service
 from selenium.webdriver.edge.options import Options
 from selenium.common.exceptions import WebDriverException
 
-# Strip the verbose "Stacktrace:\n0x7ff..." block from WebDriver errors.
-_STACKTRACE_RE = re.compile(r'\s*Stacktrace:\s*\n.*', re.DOTALL)
+_WEBDRIVER_NOISE_RE = re.compile(
+    r'\s*\n\s*from unknown error:.*'
+    r'|\s*\n\s*\(Session info:.*'
+    r'|\s*Stacktrace:\s*\n.*',
+    re.DOTALL,
+)
 
 
 def _short_err(exc):
     """Return a concise one-liner from a (possibly verbose) exception."""
-    return _STACKTRACE_RE.sub('', str(exc)).strip()
+    msg = _WEBDRIVER_NOISE_RE.sub('', str(exc)).strip()
+    if msg.startswith('Message: '):
+        msg = msg[len('Message: '):]
+    return msg
 
 
 class BrowserLauncher:

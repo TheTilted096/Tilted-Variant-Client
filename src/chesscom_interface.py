@@ -17,17 +17,31 @@ _SESSION_DEATH_KEYWORDS = (
     'waitforpendingnavigations', 'max retries exceeded',
 )
 
-# Regex that matches the "Stacktrace:\n..." block appended by ChromeDriver /
-# EdgeDriver to WebDriverException messages.  Stripping it keeps error output
-# to a single readable line instead of 20+ lines of unresolved hex addresses.
-_STACKTRACE_RE = re.compile(
-    r'\s*Stacktrace:\s*\n.*', re.DOTALL,
+# Regex that strips the verbose tail appended by ChromeDriver / EdgeDriver
+# to WebDriverException messages:
+#   "from unknown error: …\n  (Session info: …)\nStacktrace:\n0x7ff…"
+# After stripping, a typical error shrinks from ~25 lines to one:
+#   "no such window: target window already closed"
+_WEBDRIVER_NOISE_RE = re.compile(
+    r'\s*\n\s*from unknown error:.*'   # "from unknown error: web view not found"
+    r'|\s*\n\s*\(Session info:.*'      # "  (Session info: MicrosoftEdge=…)"
+    r'|\s*Stacktrace:\s*\n.*',         # "Stacktrace:\n0x7ff…" hex dump
+    re.DOTALL,
 )
 
 
 def _short_err(exc):
-    """Return a concise one-liner from a (possibly verbose) exception."""
-    return _STACKTRACE_RE.sub('', str(exc)).strip()
+    """Return a concise one-liner from a (possibly verbose) exception.
+
+    Strips the verbose multi-line tail that Chromium-based WebDrivers
+    append (``from unknown error``, ``Session info``, ``Stacktrace``).
+    Also removes the leading ``Message: `` prefix so the caller's own
+    tag (e.g. ``[ChessCom] Error detecting turn:``) reads naturally.
+    """
+    msg = _WEBDRIVER_NOISE_RE.sub('', str(exc)).strip()
+    if msg.startswith('Message: '):
+        msg = msg[len('Message: '):]
+    return msg
 
 
 class ChessComInterface:
@@ -58,6 +72,22 @@ class ChessComInterface:
         # that sidebar nav links (Play, Puzzles, Other …) are never
         # accidentally matched.  None = not yet measured.
         self._sidebar_right_cache = None   # float | None
+
+    def _is_session_dead(self):
+        """Quick check whether the browser session is still alive.
+
+        Uses a minimal WebDriver command (``title``) — if it raises with a
+        session-death keyword the session is gone.  Returns ``True`` when
+        dead so callers can bail out early instead of cascading through
+        multiple fallback methods that will all fail noisily.
+        """
+        try:
+            _ = self.driver.title
+            return False
+        except Exception as exc:
+            return any(
+                kw in str(exc).lower() for kw in _SESSION_DEATH_KEYWORDS
+            )
 
     def focus_browser(self):
         """Bring the browser window to focus."""
@@ -633,8 +663,7 @@ class ChessComInterface:
 
         except Exception as e:
             print(f"[Board] Error detecting orientation: {_short_err(e)}")
-            import traceback
-            traceback.print_exc()
+
             return {
                 'is_flipped': False,
                 'method': 'error',
@@ -824,8 +853,7 @@ class ChessComInterface:
             return result
         except Exception as e:
             print(f"[Pieces] Error detecting piece colors: {_short_err(e)}")
-            import traceback
-            traceback.print_exc()
+
             return {'white_ranks': [], 'black_ranks': [], 'confidence': 'low'}
 
     def get_player_color(self, username=None, verbose=True):
@@ -924,8 +952,7 @@ class ChessComInterface:
         except Exception as e:
             if verbose:
                 print(f"[Player] ✗ Error detecting color: {_short_err(e)}")
-                import traceback
-                traceback.print_exc()
+
             return 'unknown'
 
     def is_board_flipped(self):
@@ -1060,6 +1087,13 @@ class ChessComInterface:
             to_square = parsed['to']
 
             print(f"[ChessCom] Move: {from_square} → {to_square}")
+
+            # Fast bail-out: if the browser is already dead, avoid
+            # cascading through get_board_orientation / detect_board_size /
+            # get_two_square_coordinates which each print their own error.
+            if self._is_session_dead():
+                print("[ChessCom] Move aborted — browser session lost")
+                return False
 
             # Board geometry is stable for an entire game.  The cache is
             # filled with one execute_script on the first move (TTL 60 s,
@@ -1633,8 +1667,7 @@ class ChessComInterface:
 
         except Exception as e:
             print(f"[ChessCom] Error handling promotion: {_short_err(e)}")
-            import traceback
-            traceback.print_exc()
+
             return False
 
     def make_move(self, uci_move):
@@ -1690,6 +1723,12 @@ class ChessComInterface:
                 return self.handle_promotion(promotion_piece)
             return True
 
+        # If the browser session died, don't waste time on fallbacks —
+        # every fallback calls get_turn() / get_board_orientation() / etc.
+        # which each emit their own error line.
+        if self._is_session_dead():
+            return False
+
         # Fallback to JS events
         print("[ChessCom] Trying JS fallback...")
         success = self.make_move_js(base_move)
@@ -1698,6 +1737,9 @@ class ChessComInterface:
             if promotion_piece:
                 return self.handle_promotion(promotion_piece)
             return True
+
+        if self._is_session_dead():
+            return False
 
         # Last resort: ActionChains (requires focus)
         print("[ChessCom] Trying ActionChains fallback...")
@@ -1990,8 +2032,7 @@ class ChessComInterface:
 
         except Exception as e:
             print(f"[ChessCom] ✗ Error finding pocket piece: {_short_err(e)}")
-            import traceback
-            traceback.print_exc()
+
             return None
 
     def make_drop_move(self, piece_type, to_square):
@@ -2255,8 +2296,7 @@ class ChessComInterface:
 
         except Exception as e:
             print(f"[ChessCom] ✗ Error resigning: {_short_err(e)}")
-            import traceback
-            traceback.print_exc()
+
             return False
 
     def rematch(self):
@@ -2353,8 +2393,7 @@ class ChessComInterface:
 
         except Exception as e:
             print(f"[ChessCom] ✗ Error clicking Rematch button: {_short_err(e)}")
-            import traceback
-            traceback.print_exc()
+
             return False
 
     def play_again(self):
@@ -2460,8 +2499,7 @@ class ChessComInterface:
 
         except Exception as e:
             print(f"[ChessCom] ✗ Error clicking Play Again button: {_short_err(e)}")
-            import traceback
-            traceback.print_exc()
+
             return False
 
     def exit_to_lobby(self):
@@ -2613,8 +2651,7 @@ class ChessComInterface:
 
         except Exception as e:
             print(f"[ChessCom] ✗ Error clicking Exit button: {_short_err(e)}")
-            import traceback
-            traceback.print_exc()
+
             return False
 
     # Maps CLI shorthand → text to type into the variant search box.
@@ -3011,8 +3048,7 @@ class ChessComInterface:
 
         except Exception as e:
             print(f"[ChessCom] ✗ Error in create_challenge: {_short_err(e)}")
-            import traceback
-            traceback.print_exc()
+
             return False
 
     def cancel_challenge(self):
@@ -3077,8 +3113,7 @@ class ChessComInterface:
                 print("[ChessCom] ✗ cancel_challenge: browser connection lost")
             else:
                 print(f"[ChessCom] ✗ Error in cancel_challenge: {_short_err(e)}")
-                import traceback
-                traceback.print_exc()
+
             return False
 
     def detect_game_started(self):
@@ -3580,8 +3615,7 @@ class ChessComInterface:
 
         except Exception as e:
             print(f"[ChessCom] ✗ Error dismissing dialog: {_short_err(e)}")
-            import traceback
-            traceback.print_exc()
+
             return False
 
     def get_game_state(self):
