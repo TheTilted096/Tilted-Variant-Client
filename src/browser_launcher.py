@@ -149,11 +149,11 @@ class BrowserLauncher:
             self.driver.set_script_timeout(5)
             # Cap the HTTP timeout for all WebDriver commands.  Without
             # this, a dead browser leaves urllib3 retrying TCP connections
-            # for ~60 s before surfacing a MaxRetryError.  10 s is more
-            # than enough for any legitimate command (JS snippets complete
-            # in <100 ms) and lets session-death detection fire quickly.
+            # for ~60 s before surfacing a MaxRetryError.  5 s is ample
+            # for any legitimate command (JS snippets complete in <100 ms)
+            # and lets session-death detection fire within seconds.
             try:
-                self.driver.command_executor.set_timeout(10)
+                self.driver.command_executor.set_timeout(5)
             except Exception:
                 pass
             print("[Browser] Successfully connected to Edge!")

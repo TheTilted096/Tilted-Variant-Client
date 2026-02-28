@@ -41,6 +41,20 @@ _SESSION_DEATH_KEYWORDS = (
     'max retries exceeded',
 )
 
+# Subset of _SESSION_DEATH_KEYWORDS that indicate the WebDriver HTTP
+# endpoint is completely gone (process killed, port closed).  These are
+# unambiguous — no amount of retrying will help — so recovery should
+# trigger after far fewer consecutive failures than softer errors like
+# "invalid session" or "no such window" (which can be transient during
+# page navigation).
+_HARD_DEATH_KEYWORDS = (
+    'connection refused',
+    'max retries exceeded',
+    'unable to connect',
+    'broken pipe',
+    'remotedisconnected',
+)
+
 
 def _bg_print(msg=''):
     """Print from a background thread without disrupting the readline input prompt.
@@ -123,7 +137,8 @@ class VariantsClient:
         # Session-crash detection: count consecutive WebDriver failures
         # in the monitor loop.  After a threshold, attempt recovery.
         self._session_fail_count = 0
-        self._SESSION_FAIL_THRESHOLD = 5  # trigger recovery after 5 consecutive failures
+        self._SESSION_FAIL_THRESHOLD_SOFT = 4  # transient errors (invalid session, etc.)
+        self._SESSION_FAIL_THRESHOLD_HARD = 1  # connection refused / port gone
 
     def start(self):
         """Start the variants client."""
@@ -211,7 +226,16 @@ class VariantsClient:
                 )
                 if is_session_dead:
                     self._session_fail_count += 1
-                    if self._session_fail_count >= self._SESSION_FAIL_THRESHOLD:
+                    # "Connection refused" / port gone → the browser
+                    # process is dead; recover immediately instead of
+                    # waiting for several more 10-second timeouts.
+                    is_hard = any(
+                        kw in err_str for kw in _HARD_DEATH_KEYWORDS
+                    )
+                    threshold = (self._SESSION_FAIL_THRESHOLD_HARD
+                                 if is_hard
+                                 else self._SESSION_FAIL_THRESHOLD_SOFT)
+                    if self._session_fail_count >= threshold:
                         if self._attempt_session_recovery():
                             continue  # recovered — resume monitoring
                         else:
