@@ -6,6 +6,16 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 from uci_handler import UCIHandler
 
+# Substrings (lowercase) indicating the browser session is dead.
+# Keep in sync with the matching tuple in variants_client.py.
+_SESSION_DEATH_KEYWORDS = (
+    'invalid session', 'no such window', 'chrome not reachable',
+    'connection aborted', 'connection refused', 'forcibly closed',
+    'remotedisconnected', 'broken pipe', 'session not created',
+    'target window already closed', 'unable to connect',
+    'waitforpendingnavigations',
+)
+
 
 class ChessComInterface:
     """Handles interaction with chess.com game interface."""
@@ -1195,7 +1205,8 @@ class ChessComInterface:
                         'button': 'left', 'clickCount': 1
                     })
                 except Exception as cdp_error:
-                    print(f"[ChessCom] ✗ CDP error: {cdp_error}")
+                    first_line = str(cdp_error).split('\n', 1)[0][:120]
+                    print(f"[ChessCom] ✗ CDP error: {first_line}")
                     return False
 
             # Brief settle for chess.com to process the move.
@@ -1203,9 +1214,11 @@ class ChessComInterface:
             return True
 
         except Exception as e:
-            print(f"[ChessCom] Error making move: {e}")
-            import traceback
-            traceback.print_exc()
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in _SESSION_DEATH_KEYWORDS):
+                print("[ChessCom] Move aborted — browser session lost")
+            else:
+                print(f"[ChessCom] Error making move: {e}")
             return False
 
     def make_move_js(self, uci_move):
@@ -1360,9 +1373,11 @@ class ChessComInterface:
                 return result.get('success', False)
 
         except Exception as e:
-            print(f"[ChessCom] Error making move: {e}")
-            import traceback
-            traceback.print_exc()
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in _SESSION_DEATH_KEYWORDS):
+                print("[ChessCom] Move aborted — browser session lost")
+            else:
+                print(f"[ChessCom] Error making move: {e}")
             return False
 
     def handle_promotion(self, promotion_piece):
@@ -1775,9 +1790,11 @@ class ChessComInterface:
                 return True
 
         except Exception as e:
-            print(f"[ChessCom] Error making move: {e}")
-            import traceback
-            traceback.print_exc()
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in _SESSION_DEATH_KEYWORDS):
+                print("[ChessCom] Move aborted — browser session lost")
+            else:
+                print(f"[ChessCom] Error making move: {e}")
             return False
 
     def get_pocket_piece_coordinates(self, piece_type, player_color=None):
@@ -2046,13 +2063,16 @@ class ChessComInterface:
                 return True
 
             except Exception as cdp_error:
-                print(f"[ChessCom] ✗ CDP error during drop: {cdp_error}")
+                first_line = str(cdp_error).split('\n', 1)[0][:120]
+                print(f"[ChessCom] ✗ CDP error during drop: {first_line}")
                 return False
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error executing drop move: {e}")
-            import traceback
-            traceback.print_exc()
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in _SESSION_DEATH_KEYWORDS):
+                print("[ChessCom] Drop move aborted — browser session lost")
+            else:
+                print(f"[ChessCom] ✗ Error executing drop move: {e}")
             return False
 
     def resign(self):

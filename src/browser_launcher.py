@@ -162,12 +162,41 @@ class BrowserLauncher:
             except Exception:
                 pass
 
+            # Close any tabs that Edge restored from a previous session so
+            # we start with a single chess.com/variants tab.
+            self._close_extra_tabs()
+
             return self.driver
 
         except Exception as e:
             print(f"[Browser] Failed to connect to Edge: {e}")
             print("[Browser] Make sure Edge is running with debugging enabled.")
             raise
+
+    def _close_extra_tabs(self):
+        """Close duplicate tabs, keeping only one.
+
+        Edge may restore tabs from a previous session alongside the one
+        opened by our launch command, resulting in two (or more) chess.com
+        tabs.  Close all but the last window handle (which is the tab our
+        launch command opened).
+        """
+        try:
+            handles = self.driver.window_handles
+            if len(handles) <= 1:
+                return
+            # The tab opened by our launch command is typically the last
+            # handle.  Keep it; close everything else.
+            keep = handles[-1]
+            for h in handles:
+                if h != keep:
+                    self.driver.switch_to.window(h)
+                    self.driver.close()
+            self.driver.switch_to.window(keep)
+            print(f"[Browser] Closed {len(handles) - 1} restored tab(s)")
+        except Exception:
+            # Non-fatal — if tab cleanup fails we can still function.
+            pass
 
     def launch_edge(self):
         """Launch Edge and connect to it."""

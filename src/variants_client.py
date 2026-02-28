@@ -17,6 +17,27 @@ _ENGINES_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'engines'
 )
 
+# Substrings (lowercase) that indicate the WebDriver session is dead or the
+# browser is shutting down.  Kept in one place so both process_console_events
+# and background_monitor_loop stay in sync.
+_SESSION_DEATH_KEYWORDS = (
+    'invalid session',
+    'no such window',
+    'chrome not reachable',
+    'connection aborted',
+    'connection refused',
+    'forcibly closed',
+    'remotedisconnected',
+    'broken pipe',
+    'session not created',
+    'target window already closed',
+    'unable to connect',
+    # Transient Chromium internal error that fires when the browser is in
+    # the middle of closing / navigating — treated as session-death so the
+    # recovery path handles it instead of dumping a stack trace.
+    'waitforpendingnavigations',
+)
+
 
 def _bg_print(msg=''):
     """Print from a background thread without disrupting the readline input prompt.
@@ -182,20 +203,8 @@ class VariantsClient:
                 time.sleep(self.monitor_interval)
             except Exception as e:
                 err_str = str(e).lower()
-                is_session_dead = (
-                    'invalid session' in err_str
-                    or 'no such window' in err_str
-                    or 'unable to connect' in err_str
-                    or 'session not created' in err_str
-                    or 'chrome not reachable' in err_str
-                    or 'target window already closed' in err_str
-                    # Low-level socket / connection errors (Ctrl+W,
-                    # Cold Turkey kill, process crash, etc.)
-                    or 'connection aborted' in err_str
-                    or 'connection refused' in err_str
-                    or 'forcibly closed' in err_str
-                    or 'remotedisconnected' in err_str
-                    or 'broken pipe' in err_str
+                is_session_dead = any(
+                    kw in err_str for kw in _SESSION_DEATH_KEYWORDS
                 )
                 if is_session_dead:
                     self._session_fail_count += 1
@@ -209,9 +218,8 @@ class VariantsClient:
                         # Brief pause before next attempt
                         time.sleep(0.5)
                 else:
-                    print(f"[Monitor] Error in background loop: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    first_line = str(e).split('\n', 1)[0][:120]
+                    print(f"[Monitor] Error in background loop: {first_line}")
 
     def process_console_events(self):
         """
@@ -295,16 +303,11 @@ class VariantsClient:
             err_str = str(e).lower()
             # Let session-death errors propagate to the monitor loop so
             # the consecutive-failure counter can trigger recovery.
-            if ('invalid session' in err_str
-                    or 'no such window' in err_str
-                    or 'chrome not reachable' in err_str
-                    or 'connection aborted' in err_str
-                    or 'connection refused' in err_str
-                    or 'forcibly closed' in err_str
-                    or 'remotedisconnected' in err_str
-                    or 'broken pipe' in err_str):
+            if any(kw in err_str for kw in _SESSION_DEATH_KEYWORDS):
                 raise
-            print(f"[Debug] Error in process_console_events: {e}")
+            # Non-fatal — log a short one-liner (no stack trace).
+            first_line = str(e).split('\n', 1)[0][:120]
+            print(f"[Debug] Error in process_console_events: {first_line}")
 
     def _check_for_missed_move(self):
         """Fallback: detect and recover from a missed move-observer event.
