@@ -1,4 +1,5 @@
 """Chess.com interface for interacting with the game board."""
+import re
 import time
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -15,6 +16,18 @@ _SESSION_DEATH_KEYWORDS = (
     'target window already closed', 'unable to connect',
     'waitforpendingnavigations', 'max retries exceeded',
 )
+
+# Regex that matches the "Stacktrace:\n..." block appended by ChromeDriver /
+# EdgeDriver to WebDriverException messages.  Stripping it keeps error output
+# to a single readable line instead of 20+ lines of unresolved hex addresses.
+_STACKTRACE_RE = re.compile(
+    r'\s*Stacktrace:\s*\n.*', re.DOTALL,
+)
+
+
+def _short_err(exc):
+    """Return a concise one-liner from a (possibly verbose) exception."""
+    return _STACKTRACE_RE.sub('', str(exc)).strip()
 
 
 class ChessComInterface:
@@ -56,7 +69,7 @@ class ChessComInterface:
             # Small delay to ensure focus is transferred
             time.sleep(0.3)
         except Exception as e:
-            print(f"[ChessCom] Warning: Could not focus browser: {e}")
+            print(f"[ChessCom] Warning: Could not focus browser: {_short_err(e)}")
 
     # ── Board-parameter cache ─────────────────────────────────────────────────
 
@@ -339,7 +352,7 @@ class ChessComInterface:
             return result
 
         except Exception as e:
-            print(f"[Board] Error detecting size, defaulting to 8x8: {e}")
+            print(f"[Board] Error detecting size, defaulting to 8x8: {_short_err(e)}")
             return {'files': 8, 'ranks': 8, 'method': 'error'}
 
     def get_fen(self):
@@ -383,7 +396,7 @@ class ChessComInterface:
             fen = self.driver.execute_script(js_script)
             return fen if fen else None
         except Exception as e:
-            print(f"[ChessCom] Error getting FEN: {e}")
+            print(f"[ChessCom] Error getting FEN: {_short_err(e)}")
             return None
 
 
@@ -448,7 +461,7 @@ class ChessComInterface:
             turn = self.driver.execute_script(js_script)
             return turn
         except Exception as e:
-            print(f"[ChessCom] Error detecting turn: {e}")
+            print(f"[ChessCom] Error detecting turn: {_short_err(e)}")
             return 'unknown'
 
     def get_board_orientation(self):
@@ -619,7 +632,7 @@ class ChessComInterface:
             return result
 
         except Exception as e:
-            print(f"[Board] Error detecting orientation: {e}")
+            print(f"[Board] Error detecting orientation: {_short_err(e)}")
             import traceback
             traceback.print_exc()
             return {
@@ -659,7 +672,7 @@ class ChessComInterface:
                 return None
         except Exception as e:
             if verbose:
-                print(f"[Player] Error detecting username: {e}")
+                print(f"[Player] Error detecting username: {_short_err(e)}")
             return None
 
     def get_player_position(self, username):
@@ -703,7 +716,7 @@ class ChessComInterface:
             print(f"[Player] Username '{username}' found in {position} playerbox")
             return position
         except Exception as e:
-            print(f"[Player] Error finding player position: {e}")
+            print(f"[Player] Error finding player position: {_short_err(e)}")
             return 'unknown'
 
     def detect_piece_colors(self):
@@ -810,7 +823,7 @@ class ChessComInterface:
 
             return result
         except Exception as e:
-            print(f"[Pieces] Error detecting piece colors: {e}")
+            print(f"[Pieces] Error detecting piece colors: {_short_err(e)}")
             import traceback
             traceback.print_exc()
             return {'white_ranks': [], 'black_ranks': [], 'confidence': 'low'}
@@ -910,7 +923,7 @@ class ChessComInterface:
 
         except Exception as e:
             if verbose:
-                print(f"[Player] ✗ Error detecting color: {e}")
+                print(f"[Player] ✗ Error detecting color: {_short_err(e)}")
                 import traceback
                 traceback.print_exc()
             return 'unknown'
@@ -1021,7 +1034,7 @@ class ChessComInterface:
             coords = self.driver.execute_script(js_script)
             return coords
         except Exception as e:
-            print(f"[ChessCom] Error getting coordinates for {square}: {e}")
+            print(f"[ChessCom] Error getting coordinates for {square}: {_short_err(e)}")
             return None
 
     def make_move_cdp(self, uci_move):
@@ -1205,8 +1218,7 @@ class ChessComInterface:
                         'button': 'left', 'clickCount': 1
                     })
                 except Exception as cdp_error:
-                    first_line = str(cdp_error).split('\n', 1)[0][:120]
-                    print(f"[ChessCom] ✗ CDP error: {first_line}")
+                    print(f"[ChessCom] ✗ CDP error: {_short_err(cdp_error)}")
                     return False
 
             # Brief settle for chess.com to process the move.
@@ -1218,7 +1230,7 @@ class ChessComInterface:
             if any(kw in err_str for kw in _SESSION_DEATH_KEYWORDS):
                 print("[ChessCom] Move aborted — browser session lost")
             else:
-                print(f"[ChessCom] Error making move: {e}")
+                print(f"[ChessCom] Error making move: {_short_err(e)}")
             return False
 
     def make_move_js(self, uci_move):
@@ -1377,7 +1389,7 @@ class ChessComInterface:
             if any(kw in err_str for kw in _SESSION_DEATH_KEYWORDS):
                 print("[ChessCom] Move aborted — browser session lost")
             else:
-                print(f"[ChessCom] Error making move: {e}")
+                print(f"[ChessCom] Error making move: {_short_err(e)}")
             return False
 
     def handle_promotion(self, promotion_piece):
@@ -1610,7 +1622,7 @@ class ChessComInterface:
                         return True
 
                 except Exception as cdp_error:
-                    print(f"[ChessCom] ✗ CDP click failed: {cdp_error}")
+                    print(f"[ChessCom] ✗ CDP click failed: {_short_err(cdp_error)}")
                     return False
             else:
                 error_msg = f"[ChessCom] ✗ Promotion piece not found"
@@ -1620,7 +1632,7 @@ class ChessComInterface:
                 return False
 
         except Exception as e:
-            print(f"[ChessCom] Error handling promotion: {e}")
+            print(f"[ChessCom] Error handling promotion: {_short_err(e)}")
             import traceback
             traceback.print_exc()
             return False
@@ -1794,7 +1806,7 @@ class ChessComInterface:
             if any(kw in err_str for kw in _SESSION_DEATH_KEYWORDS):
                 print("[ChessCom] Move aborted — browser session lost")
             else:
-                print(f"[ChessCom] Error making move: {e}")
+                print(f"[ChessCom] Error making move: {_short_err(e)}")
             return False
 
     def get_pocket_piece_coordinates(self, piece_type, player_color=None):
@@ -1977,7 +1989,7 @@ class ChessComInterface:
                 return None
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error finding pocket piece: {e}")
+            print(f"[ChessCom] ✗ Error finding pocket piece: {_short_err(e)}")
             import traceback
             traceback.print_exc()
             return None
@@ -2063,8 +2075,7 @@ class ChessComInterface:
                 return True
 
             except Exception as cdp_error:
-                first_line = str(cdp_error).split('\n', 1)[0][:120]
-                print(f"[ChessCom] ✗ CDP error during drop: {first_line}")
+                print(f"[ChessCom] ✗ CDP error during drop: {_short_err(cdp_error)}")
                 return False
 
         except Exception as e:
@@ -2072,7 +2083,7 @@ class ChessComInterface:
             if any(kw in err_str for kw in _SESSION_DEATH_KEYWORDS):
                 print("[ChessCom] Drop move aborted — browser session lost")
             else:
-                print(f"[ChessCom] ✗ Error executing drop move: {e}")
+                print(f"[ChessCom] ✗ Error executing drop move: {_short_err(e)}")
             return False
 
     def resign(self):
@@ -2243,7 +2254,7 @@ class ChessComInterface:
                 return False
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error resigning: {e}")
+            print(f"[ChessCom] ✗ Error resigning: {_short_err(e)}")
             import traceback
             traceback.print_exc()
             return False
@@ -2341,7 +2352,7 @@ class ChessComInterface:
                 return False
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error clicking Rematch button: {e}")
+            print(f"[ChessCom] ✗ Error clicking Rematch button: {_short_err(e)}")
             import traceback
             traceback.print_exc()
             return False
@@ -2448,7 +2459,7 @@ class ChessComInterface:
                 return False
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error clicking Play Again button: {e}")
+            print(f"[ChessCom] ✗ Error clicking Play Again button: {_short_err(e)}")
             import traceback
             traceback.print_exc()
             return False
@@ -2601,7 +2612,7 @@ class ChessComInterface:
                 return False
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error clicking Exit button: {e}")
+            print(f"[ChessCom] ✗ Error clicking Exit button: {_short_err(e)}")
             import traceback
             traceback.print_exc()
             return False
@@ -2999,7 +3010,7 @@ class ChessComInterface:
             return True
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error in create_challenge: {e}")
+            print(f"[ChessCom] ✗ Error in create_challenge: {_short_err(e)}")
             import traceback
             traceback.print_exc()
             return False
@@ -3065,7 +3076,7 @@ class ChessComInterface:
             )):
                 print("[ChessCom] ✗ cancel_challenge: browser connection lost")
             else:
-                print(f"[ChessCom] ✗ Error in cancel_challenge: {e}")
+                print(f"[ChessCom] ✗ Error in cancel_challenge: {_short_err(e)}")
                 import traceback
                 traceback.print_exc()
             return False
@@ -3152,7 +3163,7 @@ class ChessComInterface:
             return result
 
         except Exception as e:
-            print(f"[ChessCom] Error detecting game start: {e}")
+            print(f"[ChessCom] Error detecting game start: {_short_err(e)}")
             return {'started': False, 'game_number': None, 'method': None}
 
     def setup_move_observer(self):
@@ -3222,7 +3233,7 @@ class ChessComInterface:
             result = self.driver.execute_script(js_script)
             return result
         except Exception as e:
-            print(f"[ChessCom] Error setting up move observer: {e}")
+            print(f"[ChessCom] Error setting up move observer: {_short_err(e)}")
             return False
 
     def reset_game_over_observer(self):
@@ -3332,7 +3343,7 @@ class ChessComInterface:
             self.driver.execute_script(js_script)
             return True
         except Exception as e:
-            print(f"[ChessCom] Error setting up game over observer: {e}")
+            print(f"[ChessCom] Error setting up game over observer: {_short_err(e)}")
             return False
 
     def detect_game_over(self):
@@ -3421,7 +3432,7 @@ class ChessComInterface:
             return result
 
         except Exception as e:
-            print(f"[ChessCom] Error detecting game over: {e}")
+            print(f"[ChessCom] Error detecting game over: {_short_err(e)}")
             return {'game_over': False, 'result': None, 'dialog_found': False}
 
     def dismiss_game_over_dialog(self):
@@ -3568,7 +3579,7 @@ class ChessComInterface:
                 return False
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error dismissing dialog: {e}")
+            print(f"[ChessCom] ✗ Error dismissing dialog: {_short_err(e)}")
             import traceback
             traceback.print_exc()
             return False
@@ -3605,7 +3616,7 @@ class ChessComInterface:
             }
 
         except Exception as e:
-            print(f"[ChessCom] Error getting game state: {e}")
+            print(f"[ChessCom] Error getting game state: {_short_err(e)}")
             return {
                 'in_game': False,
                 'username': None,
@@ -4291,7 +4302,7 @@ class ChessComInterface:
             data = self.driver.execute_script(js_script)
         except Exception as e:
             if verbose:
-                print(f"[getmove] Script error: {e}")
+                print(f"[getmove] Script error: {_short_err(e)}")
             return None
 
         if not data:

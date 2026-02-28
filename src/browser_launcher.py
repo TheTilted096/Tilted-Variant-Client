@@ -1,4 +1,5 @@
 """Browser launcher module for Edge with remote debugging."""
+import re
 import subprocess
 import time
 import os
@@ -7,6 +8,14 @@ from selenium import webdriver
 from selenium.webdriver.edge.service import Service
 from selenium.webdriver.edge.options import Options
 from selenium.common.exceptions import WebDriverException
+
+# Strip the verbose "Stacktrace:\n0x7ff..." block from WebDriver errors.
+_STACKTRACE_RE = re.compile(r'\s*Stacktrace:\s*\n.*', re.DOTALL)
+
+
+def _short_err(exc):
+    """Return a concise one-liner from a (possibly verbose) exception."""
+    return _STACKTRACE_RE.sub('', str(exc)).strip()
 
 
 class BrowserLauncher:
@@ -115,7 +124,7 @@ class BrowserLauncher:
             return True
 
         except Exception as e:
-            print(f"[Browser] Failed to launch Edge process: {e}")
+            print(f"[Browser] Failed to launch Edge process: {_short_err(e)}")
             raise
 
     def connect_to_edge(self):
@@ -178,7 +187,7 @@ class BrowserLauncher:
             return self.driver
 
         except Exception as e:
-            print(f"[Browser] Failed to connect to Edge: {e}")
+            print(f"[Browser] Failed to connect to Edge: {_short_err(e)}")
             print("[Browser] Make sure Edge is running with debugging enabled.")
             raise
 
@@ -273,7 +282,7 @@ class BrowserLauncher:
             try:
                 self.driver.quit()
             except Exception as e:
-                print(f"[Browser] Error closing driver: {e}")
+                print(f"[Browser] Error closing driver: {_short_err(e)}")
             self.driver = None
 
         # Terminate the Edge process
@@ -315,4 +324,4 @@ class BrowserLauncher:
                         self.edge_process.kill()
                 print("[Browser] Edge process terminated")
             except Exception as e:
-                print(f"[Browser] Error terminating Edge process: {e}")
+                print(f"[Browser] Error terminating Edge process: {_short_err(e)}")
