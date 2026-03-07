@@ -1,10 +1,47 @@
 """Chess.com interface for interacting with the game board."""
+import re
 import time
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 from uci_handler import UCIHandler
+
+# Substrings (lowercase) indicating the browser session is dead.
+# Keep in sync with the matching tuple in variants_client.py.
+_SESSION_DEATH_KEYWORDS = (
+    'invalid session', 'no such window', 'chrome not reachable',
+    'connection aborted', 'connection refused', 'forcibly closed',
+    'remotedisconnected', 'broken pipe', 'session not created',
+    'target window already closed', 'unable to connect',
+    'waitforpendingnavigations', 'max retries exceeded',
+)
+
+# Regex that strips the verbose tail appended by ChromeDriver / EdgeDriver
+# to WebDriverException messages:
+#   "from unknown error: …\n  (Session info: …)\nStacktrace:\n0x7ff…"
+# After stripping, a typical error shrinks from ~25 lines to one:
+#   "no such window: target window already closed"
+_WEBDRIVER_NOISE_RE = re.compile(
+    r'\s*\n\s*from unknown error:.*'   # "from unknown error: web view not found"
+    r'|\s*\n\s*\(Session info:.*'      # "  (Session info: MicrosoftEdge=…)"
+    r'|\s*Stacktrace:\s*\n.*',         # "Stacktrace:\n0x7ff…" hex dump
+    re.DOTALL,
+)
+
+
+def _short_err(exc):
+    """Return a concise one-liner from a (possibly verbose) exception.
+
+    Strips the verbose multi-line tail that Chromium-based WebDrivers
+    append (``from unknown error``, ``Session info``, ``Stacktrace``).
+    Also removes the leading ``Message: `` prefix so the caller's own
+    tag (e.g. ``[ChessCom] Error detecting turn:``) reads naturally.
+    """
+    msg = _WEBDRIVER_NOISE_RE.sub('', str(exc)).strip()
+    if msg.startswith('Message: '):
+        msg = msg[len('Message: '):]
+    return msg
 
 
 class ChessComInterface:
@@ -30,6 +67,27 @@ class ChessComInterface:
         # 1-2 execute_script calls (href + title) from every get_last_move()
         # invocation.  Cleared alongside board params when a new game starts.
         self._variant_name_cache = None   # str | None
+        # Cached right-edge of the left sidebar (CSS px).  Measured once
+        # from the DOM; used as an exclusion zone for button searches so
+        # that sidebar nav links (Play, Puzzles, Other …) are never
+        # accidentally matched.  None = not yet measured.
+        self._sidebar_right_cache = None   # float | None
+
+    def _is_session_dead(self):
+        """Quick check whether the browser session is still alive.
+
+        Uses a minimal WebDriver command (``title``) — if it raises with a
+        session-death keyword the session is gone.  Returns ``True`` when
+        dead so callers can bail out early instead of cascading through
+        multiple fallback methods that will all fail noisily.
+        """
+        try:
+            _ = self.driver.title
+            return False
+        except Exception as exc:
+            return any(
+                kw in str(exc).lower() for kw in _SESSION_DEATH_KEYWORDS
+            )
 
     def focus_browser(self):
         """Bring the browser window to focus."""
@@ -41,7 +99,7 @@ class ChessComInterface:
             # Small delay to ensure focus is transferred
             time.sleep(0.3)
         except Exception as e:
-            print(f"[ChessCom] Warning: Could not focus browser: {e}")
+            print(f"[ChessCom] Warning: Could not focus browser: {_short_err(e)}")
 
     # ── Board-parameter cache ─────────────────────────────────────────────────
 
@@ -85,6 +143,47 @@ class ChessComInterface:
         self._board_params_cache = None
         self._board_params_time  = 0.0
         self._variant_name_cache = None
+
+    def _get_sidebar_right(self):
+        """Return the right-edge x-coordinate of the left sidebar (CSS px).
+
+        Measured from the DOM on first call and cached for the session.
+        The sidebar width is fixed for a given viewport / zoom level and
+        doesn't change across games, so a single measurement suffices.
+
+        Falls back to 0 (no exclusion zone) if the sidebar element
+        cannot be found — this is conservative because the hardcoded
+        fallback is only active when the page layout is unrecognisable,
+        and a zero threshold never rejects a real button.
+        """
+        if self._sidebar_right_cache is not None:
+            return self._sidebar_right_cache
+        try:
+            right = self.driver.execute_script("""
+                // Chess.com's left sidebar uses a <nav> with id 'sb'.
+                // Fall back to any narrow, tall, left-anchored <nav>.
+                let nav = document.getElementById('sb');
+                if (!nav) {
+                    for (const el of document.querySelectorAll(
+                            'nav, [class*="sidebar"], [class*="side-nav"]')) {
+                        const r = el.getBoundingClientRect();
+                        if (r.left < 10 && r.height > window.innerHeight * 0.4
+                                && r.width > 0 && r.width < 400) {
+                            nav = el;
+                            break;
+                        }
+                    }
+                }
+                if (nav) {
+                    const r = nav.getBoundingClientRect();
+                    if (r.width > 0 && r.width < 400) return r.right;
+                }
+                return 0;
+            """) or 0
+            self._sidebar_right_cache = float(right)
+        except Exception:
+            self._sidebar_right_cache = 0.0
+        return self._sidebar_right_cache
 
     def _coords_for_square_py(self, square, is_flipped, board_size, board_rect):
         """Return {'x': float, 'y': float} for square using pure Python arithmetic.
@@ -283,7 +382,7 @@ class ChessComInterface:
             return result
 
         except Exception as e:
-            print(f"[Board] Error detecting size, defaulting to 8x8: {e}")
+            print(f"[Board] Error detecting size, defaulting to 8x8: {_short_err(e)}")
             return {'files': 8, 'ranks': 8, 'method': 'error'}
 
     def get_fen(self):
@@ -327,7 +426,7 @@ class ChessComInterface:
             fen = self.driver.execute_script(js_script)
             return fen if fen else None
         except Exception as e:
-            print(f"[ChessCom] Error getting FEN: {e}")
+            print(f"[ChessCom] Error getting FEN: {_short_err(e)}")
             return None
 
 
@@ -392,7 +491,7 @@ class ChessComInterface:
             turn = self.driver.execute_script(js_script)
             return turn
         except Exception as e:
-            print(f"[ChessCom] Error detecting turn: {e}")
+            print(f"[ChessCom] Error detecting turn: {_short_err(e)}")
             return 'unknown'
 
     def get_board_orientation(self):
@@ -563,9 +662,8 @@ class ChessComInterface:
             return result
 
         except Exception as e:
-            print(f"[Board] Error detecting orientation: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[Board] Error detecting orientation: {_short_err(e)}")
+
             return {
                 'is_flipped': False,
                 'method': 'error',
@@ -603,7 +701,7 @@ class ChessComInterface:
                 return None
         except Exception as e:
             if verbose:
-                print(f"[Player] Error detecting username: {e}")
+                print(f"[Player] Error detecting username: {_short_err(e)}")
             return None
 
     def get_player_position(self, username):
@@ -647,7 +745,7 @@ class ChessComInterface:
             print(f"[Player] Username '{username}' found in {position} playerbox")
             return position
         except Exception as e:
-            print(f"[Player] Error finding player position: {e}")
+            print(f"[Player] Error finding player position: {_short_err(e)}")
             return 'unknown'
 
     def detect_piece_colors(self):
@@ -754,9 +852,8 @@ class ChessComInterface:
 
             return result
         except Exception as e:
-            print(f"[Pieces] Error detecting piece colors: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[Pieces] Error detecting piece colors: {_short_err(e)}")
+
             return {'white_ranks': [], 'black_ranks': [], 'confidence': 'low'}
 
     def get_player_color(self, username=None, verbose=True):
@@ -854,9 +951,8 @@ class ChessComInterface:
 
         except Exception as e:
             if verbose:
-                print(f"[Player] ✗ Error detecting color: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"[Player] ✗ Error detecting color: {_short_err(e)}")
+
             return 'unknown'
 
     def is_board_flipped(self):
@@ -965,7 +1061,7 @@ class ChessComInterface:
             coords = self.driver.execute_script(js_script)
             return coords
         except Exception as e:
-            print(f"[ChessCom] Error getting coordinates for {square}: {e}")
+            print(f"[ChessCom] Error getting coordinates for {square}: {_short_err(e)}")
             return None
 
     def make_move_cdp(self, uci_move):
@@ -991,6 +1087,13 @@ class ChessComInterface:
             to_square = parsed['to']
 
             print(f"[ChessCom] Move: {from_square} → {to_square}")
+
+            # Fast bail-out: if the browser is already dead, avoid
+            # cascading through get_board_orientation / detect_board_size /
+            # get_two_square_coordinates which each print their own error.
+            if self._is_session_dead():
+                print("[ChessCom] Move aborted — browser session lost")
+                return False
 
             # Board geometry is stable for an entire game.  The cache is
             # filled with one execute_script on the first move (TTL 60 s,
@@ -1149,7 +1252,7 @@ class ChessComInterface:
                         'button': 'left', 'clickCount': 1
                     })
                 except Exception as cdp_error:
-                    print(f"[ChessCom] ✗ CDP error: {cdp_error}")
+                    print(f"[ChessCom] ✗ CDP error: {_short_err(cdp_error)}")
                     return False
 
             # Brief settle for chess.com to process the move.
@@ -1157,9 +1260,11 @@ class ChessComInterface:
             return True
 
         except Exception as e:
-            print(f"[ChessCom] Error making move: {e}")
-            import traceback
-            traceback.print_exc()
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in _SESSION_DEATH_KEYWORDS):
+                print("[ChessCom] Move aborted — browser session lost")
+            else:
+                print(f"[ChessCom] Error making move: {_short_err(e)}")
             return False
 
     def make_move_js(self, uci_move):
@@ -1314,9 +1419,11 @@ class ChessComInterface:
                 return result.get('success', False)
 
         except Exception as e:
-            print(f"[ChessCom] Error making move: {e}")
-            import traceback
-            traceback.print_exc()
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in _SESSION_DEATH_KEYWORDS):
+                print("[ChessCom] Move aborted — browser session lost")
+            else:
+                print(f"[ChessCom] Error making move: {_short_err(e)}")
             return False
 
     def handle_promotion(self, promotion_piece):
@@ -1549,7 +1656,7 @@ class ChessComInterface:
                         return True
 
                 except Exception as cdp_error:
-                    print(f"[ChessCom] ✗ CDP click failed: {cdp_error}")
+                    print(f"[ChessCom] ✗ CDP click failed: {_short_err(cdp_error)}")
                     return False
             else:
                 error_msg = f"[ChessCom] ✗ Promotion piece not found"
@@ -1559,9 +1666,8 @@ class ChessComInterface:
                 return False
 
         except Exception as e:
-            print(f"[ChessCom] Error handling promotion: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[ChessCom] Error handling promotion: {_short_err(e)}")
+
             return False
 
     def make_move(self, uci_move):
@@ -1617,6 +1723,12 @@ class ChessComInterface:
                 return self.handle_promotion(promotion_piece)
             return True
 
+        # If the browser session died, don't waste time on fallbacks —
+        # every fallback calls get_turn() / get_board_orientation() / etc.
+        # which each emit their own error line.
+        if self._is_session_dead():
+            return False
+
         # Fallback to JS events
         print("[ChessCom] Trying JS fallback...")
         success = self.make_move_js(base_move)
@@ -1625,6 +1737,9 @@ class ChessComInterface:
             if promotion_piece:
                 return self.handle_promotion(promotion_piece)
             return True
+
+        if self._is_session_dead():
+            return False
 
         # Last resort: ActionChains (requires focus)
         print("[ChessCom] Trying ActionChains fallback...")
@@ -1729,9 +1844,11 @@ class ChessComInterface:
                 return True
 
         except Exception as e:
-            print(f"[ChessCom] Error making move: {e}")
-            import traceback
-            traceback.print_exc()
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in _SESSION_DEATH_KEYWORDS):
+                print("[ChessCom] Move aborted — browser session lost")
+            else:
+                print(f"[ChessCom] Error making move: {_short_err(e)}")
             return False
 
     def get_pocket_piece_coordinates(self, piece_type, player_color=None):
@@ -1914,9 +2031,8 @@ class ChessComInterface:
                 return None
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error finding pocket piece: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[ChessCom] ✗ Error finding pocket piece: {_short_err(e)}")
+
             return None
 
     def make_drop_move(self, piece_type, to_square):
@@ -2000,13 +2116,15 @@ class ChessComInterface:
                 return True
 
             except Exception as cdp_error:
-                print(f"[ChessCom] ✗ CDP error during drop: {cdp_error}")
+                print(f"[ChessCom] ✗ CDP error during drop: {_short_err(cdp_error)}")
                 return False
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error executing drop move: {e}")
-            import traceback
-            traceback.print_exc()
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in _SESSION_DEATH_KEYWORDS):
+                print("[ChessCom] Drop move aborted — browser session lost")
+            else:
+                print(f"[ChessCom] ✗ Error executing drop move: {_short_err(e)}")
             return False
 
     def resign(self):
@@ -2177,9 +2295,8 @@ class ChessComInterface:
                 return False
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error resigning: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[ChessCom] ✗ Error resigning: {_short_err(e)}")
+
             return False
 
     def rematch(self):
@@ -2193,6 +2310,7 @@ class ChessComInterface:
 
         try:
             js_script = """
+            const SIDEBAR_RIGHT = arguments[0];
             // Find rematch button - appears after game ends
             const rematchSelectors = [
                 'button[aria-label*="Rematch"]',
@@ -2211,7 +2329,7 @@ class ChessComInterface:
 
                 if (text.includes('rematch') || ariaLabel.includes('rematch')) {
                     const rect = button.getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0) {
+                    if (rect.width > 0 && rect.height > 0 && rect.left > SIDEBAR_RIGHT) {
                         rematchButton = button;
                         break;
                     }
@@ -2232,7 +2350,7 @@ class ChessComInterface:
             };
             """
 
-            result = self.driver.execute_script(js_script)
+            result = self.driver.execute_script(js_script, self._get_sidebar_right())
 
             if result.get('found'):
                 x = result['x']
@@ -2274,9 +2392,8 @@ class ChessComInterface:
                 return False
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error clicking Rematch button: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[ChessCom] ✗ Error clicking Rematch button: {_short_err(e)}")
+
             return False
 
     def play_again(self):
@@ -2290,6 +2407,7 @@ class ChessComInterface:
 
         try:
             js_script = """
+            const SIDEBAR_RIGHT = arguments[0];
             // Find play again button - appears after game ends
             const playAgainSelectors = [
                 'button[aria-label*="Play"]',
@@ -2315,9 +2433,9 @@ class ChessComInterface:
                 if (hasPlayAgain || hasPlay) {
                     const rect = button.getBoundingClientRect();
 
-                    // Ignore buttons in the left sidebar (typically x < 250px)
+                    // Ignore buttons in the left sidebar
                     // We want the Play button in the main game area
-                    if (rect.width > 0 && rect.height > 0 && rect.left > 250) {
+                    if (rect.width > 0 && rect.height > 0 && rect.left > SIDEBAR_RIGHT) {
                         playAgainButton = button;
                         break;
                     }
@@ -2338,7 +2456,7 @@ class ChessComInterface:
             };
             """
 
-            result = self.driver.execute_script(js_script)
+            result = self.driver.execute_script(js_script, self._get_sidebar_right())
 
             if result.get('found'):
                 x = result['x']
@@ -2380,9 +2498,8 @@ class ChessComInterface:
                 return False
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error clicking Play Again button: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[ChessCom] ✗ Error clicking Play Again button: {_short_err(e)}")
+
             return False
 
     def exit_to_lobby(self):
@@ -2396,6 +2513,7 @@ class ChessComInterface:
 
         try:
             js_script = """
+            const SIDEBAR_RIGHT = arguments[0];
             // Find exit button - appears after game ends
             const exitSelectors = [
                 'button[aria-label*="Exit"]',
@@ -2407,6 +2525,7 @@ class ChessComInterface:
             let exitButton = null;
 
             // Look for buttons with "exit" text
+            // Ignore buttons in the left sidebar
             const allButtons = document.querySelectorAll('button, a');
             for (const button of allButtons) {
                 const text = button.textContent?.toLowerCase() || '';
@@ -2414,7 +2533,7 @@ class ChessComInterface:
 
                 if (text.includes('exit') || ariaLabel.includes('exit')) {
                     const rect = button.getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0) {
+                    if (rect.width > 0 && rect.height > 0 && rect.left > SIDEBAR_RIGHT) {
                         exitButton = button;
                         break;
                     }
@@ -2435,7 +2554,7 @@ class ChessComInterface:
             };
             """
 
-            result = self.driver.execute_script(js_script)
+            result = self.driver.execute_script(js_script, self._get_sidebar_right())
 
             if result.get('found'):
                 x = result['x']
@@ -2472,7 +2591,9 @@ class ChessComInterface:
                 print("[ChessCom] ✓ Exit button clicked")
 
                 # --- Click the Lobby tab ---
+                # Exclude the left sidebar to avoid clicking a nav link.
                 lobby_result = self.driver.execute_script("""
+                    const SIDEBAR_RIGHT = arguments[0];
                     function findTabByLabel(label) {
                         const re = new RegExp('^' + label + '$', 'i');
                         const walker = document.createTreeWalker(
@@ -2484,7 +2605,7 @@ class ChessComInterface:
                                 let el = node.parentElement;
                                 while (el && el !== document.body) {
                                     const rect = el.getBoundingClientRect();
-                                    if (rect.width > 0 && rect.height > 0) {
+                                    if (rect.width > 0 && rect.height > 0 && rect.left > SIDEBAR_RIGHT) {
                                         return {
                                             found: true,
                                             x: rect.left + rect.width / 2,
@@ -2498,7 +2619,7 @@ class ChessComInterface:
                         return { found: false };
                     }
                     return findTabByLabel('Lobby');
-                """)
+                """, self._get_sidebar_right())
 
                 if not lobby_result.get('found'):
                     print("[ChessCom] ✗ Lobby tab not found after exit")
@@ -2529,9 +2650,8 @@ class ChessComInterface:
                 return False
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error clicking Exit button: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[ChessCom] ✗ Error clicking Exit button: {_short_err(e)}")
+
             return False
 
     # Maps CLI shorthand → text to type into the variant search box.
@@ -2927,9 +3047,8 @@ class ChessComInterface:
             return True
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error in create_challenge: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[ChessCom] ✗ Error in create_challenge: {_short_err(e)}")
+
             return False
 
     def cancel_challenge(self):
@@ -2993,9 +3112,8 @@ class ChessComInterface:
             )):
                 print("[ChessCom] ✗ cancel_challenge: browser connection lost")
             else:
-                print(f"[ChessCom] ✗ Error in cancel_challenge: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"[ChessCom] ✗ Error in cancel_challenge: {_short_err(e)}")
+
             return False
 
     def detect_game_started(self):
@@ -3080,7 +3198,7 @@ class ChessComInterface:
             return result
 
         except Exception as e:
-            print(f"[ChessCom] Error detecting game start: {e}")
+            print(f"[ChessCom] Error detecting game start: {_short_err(e)}")
             return {'started': False, 'game_number': None, 'method': None}
 
     def setup_move_observer(self):
@@ -3150,7 +3268,7 @@ class ChessComInterface:
             result = self.driver.execute_script(js_script)
             return result
         except Exception as e:
-            print(f"[ChessCom] Error setting up move observer: {e}")
+            print(f"[ChessCom] Error setting up move observer: {_short_err(e)}")
             return False
 
     def reset_game_over_observer(self):
@@ -3260,7 +3378,7 @@ class ChessComInterface:
             self.driver.execute_script(js_script)
             return True
         except Exception as e:
-            print(f"[ChessCom] Error setting up game over observer: {e}")
+            print(f"[ChessCom] Error setting up game over observer: {_short_err(e)}")
             return False
 
     def detect_game_over(self):
@@ -3349,7 +3467,7 @@ class ChessComInterface:
             return result
 
         except Exception as e:
-            print(f"[ChessCom] Error detecting game over: {e}")
+            print(f"[ChessCom] Error detecting game over: {_short_err(e)}")
             return {'game_over': False, 'result': None, 'dialog_found': False}
 
     def dismiss_game_over_dialog(self):
@@ -3405,6 +3523,7 @@ class ChessComInterface:
 
             # --- Strategies 2 & 3: Find the close/X button, then CDP-click it ---
             js_script = """
+            const SIDEBAR_RIGHT = arguments[0];
             // Candidates: explicit close/dismiss buttons and aria-labelled buttons
             const closeSelectors = [
                 '[aria-label="Close"]',
@@ -3440,17 +3559,21 @@ class ChessComInterface:
                 }
             }
 
-            // If no X button found, fall back to backdrop (left of dialog)
+            // If no X button found, fall back to backdrop (left of dialog).
+            // Only target large dialogs (actual modals, not small sidebar
+            // elements that happen to match the class selectors), and clamp
+            // the click x-coordinate so it never lands on the left sidebar.
             const dialogs = document.querySelectorAll(
                 '[class*="modal"], [class*="dialog"], [class*="popup"], [class*="game-over"]'
             );
             for (const dialog of dialogs) {
                 const rect = dialog.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0) {
+                if (rect.width >= 250 && rect.height >= 200) {
+                    const bx = Math.max(SIDEBAR_RIGHT + 10, rect.left - 60);
                     return {
                         found: true,
                         method: 'backdrop',
-                        x: Math.max(10, rect.left - 60),
+                        x: bx,
                         y: rect.top + rect.height / 2
                     };
                 }
@@ -3459,7 +3582,7 @@ class ChessComInterface:
             return { found: false };
             """
 
-            result = self.driver.execute_script(js_script)
+            result = self.driver.execute_script(js_script, self._get_sidebar_right())
 
             if result.get('found'):
                 x = result['x']
@@ -3491,9 +3614,8 @@ class ChessComInterface:
                 return False
 
         except Exception as e:
-            print(f"[ChessCom] ✗ Error dismissing dialog: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[ChessCom] ✗ Error dismissing dialog: {_short_err(e)}")
+
             return False
 
     def get_game_state(self):
@@ -3528,7 +3650,7 @@ class ChessComInterface:
             }
 
         except Exception as e:
-            print(f"[ChessCom] Error getting game state: {e}")
+            print(f"[ChessCom] Error getting game state: {_short_err(e)}")
             return {
                 'in_game': False,
                 'username': None,
@@ -4214,7 +4336,7 @@ class ChessComInterface:
             data = self.driver.execute_script(js_script)
         except Exception as e:
             if verbose:
-                print(f"[getmove] Script error: {e}")
+                print(f"[getmove] Script error: {_short_err(e)}")
             return None
 
         if not data:

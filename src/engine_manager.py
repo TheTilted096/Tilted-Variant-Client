@@ -251,6 +251,23 @@ class EngineManager:
 
         return True
 
+    def stop_search(self):
+        """Send UCI ``stop`` to halt an in-progress search.
+
+        The engine will immediately reply with ``bestmove``; the
+        existing _search_worker thread will read it, clear _searching,
+        and invoke the callback (which will be discarded if the
+        generation has been bumped).
+
+        Safe to call even when no search is in progress.
+        """
+        if self.process is None or not self._searching:
+            return
+        try:
+            self._send("stop\n")
+        except Exception:
+            pass
+
     def stop(self):
         """Terminate the engine process immediately.
 
@@ -300,7 +317,10 @@ class EngineManager:
             move_list: Space-separated UCI moves played so far (may be "").
             callback:  Callable(str) invoked with the engine's chosen move.
         """
-        if self.process is None or self._searching:
+        if self.process is None:
+            return
+        if self._searching:
+            self._log("# request_move ignored: search already in progress")
             return
 
         self._searching = True
@@ -314,6 +334,9 @@ class EngineManager:
 
     def _search_worker(self, move_list, callback, t_relay_start=None):
         """Background thread: send position + go, parse bestmove."""
+        best = None
+        think_ms = 0
+        relay_ms = 0
         try:
             stripped = move_list.strip()
             if stripped:
@@ -358,9 +381,16 @@ class EngineManager:
                         f"# clock: {self.engine_color}={self.engine_time}ms"
                         f" (used {think_ms}ms)"
                     )
-                callback(best, think_ms, relay_ms)
         finally:
+            # Clear _searching BEFORE the callback.  The callback runs
+            # _verify_move_registered() which sleeps 1-5 s.  If the opponent
+            # responds during that window the monitor thread must be able to
+            # start a new search immediately — otherwise the request is
+            # silently dropped and the client stalls until timeout.
             self._searching = False
+
+        if best:
+            callback(best, think_ms, relay_ms)
 
     # ── Low-level helpers ─────────────────────────────────────────────────────
 

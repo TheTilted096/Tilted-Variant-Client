@@ -1,4 +1,5 @@
 """Browser launcher module for Edge with remote debugging."""
+import re
 import subprocess
 import time
 import os
@@ -6,6 +7,22 @@ import sys
 from selenium import webdriver
 from selenium.webdriver.edge.service import Service
 from selenium.webdriver.edge.options import Options
+from selenium.common.exceptions import WebDriverException
+
+_WEBDRIVER_NOISE_RE = re.compile(
+    r'\s*\n\s*from unknown error:.*'
+    r'|\s*\n\s*\(Session info:.*'
+    r'|\s*Stacktrace:\s*\n.*',
+    re.DOTALL,
+)
+
+
+def _short_err(exc):
+    """Return a concise one-liner from a (possibly verbose) exception."""
+    msg = _WEBDRIVER_NOISE_RE.sub('', str(exc)).strip()
+    if msg.startswith('Message: '):
+        msg = msg[len('Message: '):]
+    return msg
 
 
 class BrowserLauncher:
@@ -114,7 +131,7 @@ class BrowserLauncher:
             return True
 
         except Exception as e:
-            print(f"[Browser] Failed to launch Edge process: {e}")
+            print(f"[Browser] Failed to launch Edge process: {_short_err(e)}")
             raise
 
     def connect_to_edge(self):
@@ -130,6 +147,15 @@ class BrowserLauncher:
             # execute_async_script needs an explicit timeout; 5 s is ample
             # for any in-page async work (inter-click gap is ≤ 200 ms).
             self.driver.set_script_timeout(5)
+            # Cap the HTTP timeout for all WebDriver commands.  Without
+            # this, a dead browser leaves urllib3 retrying TCP connections
+            # for ~60 s before surfacing a MaxRetryError.  5 s is ample
+            # for any legitimate command (JS snippets complete in <100 ms)
+            # and lets session-death detection fire within seconds.
+            try:
+                self.driver.command_executor.set_timeout(5)
+            except Exception:
+                pass
             print("[Browser] Successfully connected to Edge!")
 
             # ── CDP anti-throttling (survives page navigations) ───────────────
@@ -161,12 +187,41 @@ class BrowserLauncher:
             except Exception:
                 pass
 
+            # Close any tabs that Edge restored from a previous session so
+            # we start with a single chess.com/variants tab.
+            self._close_extra_tabs()
+
             return self.driver
 
         except Exception as e:
-            print(f"[Browser] Failed to connect to Edge: {e}")
+            print(f"[Browser] Failed to connect to Edge: {_short_err(e)}")
             print("[Browser] Make sure Edge is running with debugging enabled.")
             raise
+
+    def _close_extra_tabs(self):
+        """Close duplicate tabs, keeping only one.
+
+        Edge may restore tabs from a previous session alongside the one
+        opened by our launch command, resulting in two (or more) chess.com
+        tabs.  Close all but the last window handle (which is the tab our
+        launch command opened).
+        """
+        try:
+            handles = self.driver.window_handles
+            if len(handles) <= 1:
+                return
+            # The tab opened by our launch command is typically the last
+            # handle.  Keep it; close everything else.
+            keep = handles[-1]
+            for h in handles:
+                if h != keep:
+                    self.driver.switch_to.window(h)
+                    self.driver.close()
+            self.driver.switch_to.window(keep)
+            print(f"[Browser] Closed {len(handles) - 1} restored tab(s)")
+        except Exception:
+            # Non-fatal — if tab cleanup fails we can still function.
+            pass
 
     def launch_edge(self):
         """Launch Edge and connect to it."""
@@ -174,6 +229,43 @@ class BrowserLauncher:
         self.launch_edge_process()
 
         # Then, connect Selenium to it
+        return self.connect_to_edge()
+
+    def is_session_alive(self):
+        """Return True if the WebDriver session is still responsive."""
+        if not self.driver:
+            return False
+        try:
+            self.driver.title  # lightweight round-trip
+            return True
+        except WebDriverException:
+            return False
+
+    def reconnect(self):
+        """Relaunch Edge and reconnect Selenium after a crash.
+
+        Returns the new WebDriver instance, or raises on failure.
+        """
+        print("[Browser] Session dead — attempting to relaunch Edge...")
+
+        # Dispose of the stale driver handle (ignore errors; it's dead)
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+
+        # Kill any lingering Edge process from the previous session
+        if self.edge_process:
+            try:
+                self.edge_process.kill()
+            except Exception:
+                pass
+            self.edge_process = None
+
+        # Relaunch and reconnect
+        self.launch_edge_process()
         return self.connect_to_edge()
 
     def navigate_to_chesscom_variants(self):
@@ -197,7 +289,7 @@ class BrowserLauncher:
             try:
                 self.driver.quit()
             except Exception as e:
-                print(f"[Browser] Error closing driver: {e}")
+                print(f"[Browser] Error closing driver: {_short_err(e)}")
             self.driver = None
 
         # Terminate the Edge process
@@ -239,4 +331,4 @@ class BrowserLauncher:
                         self.edge_process.kill()
                 print("[Browser] Edge process terminated")
             except Exception as e:
-                print(f"[Browser] Error terminating Edge process: {e}")
+                print(f"[Browser] Error terminating Edge process: {_short_err(e)}")
