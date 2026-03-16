@@ -75,8 +75,15 @@ def _bg_print(msg=''):
 class VariantsClient:
     """Main client for playing chess variants on chess.com."""
 
-    def __init__(self):
-        """Initialize the variants client."""
+    def __init__(self, chess_username=None):
+        """Initialize the variants client.
+
+        Args:
+            chess_username: Optional chess.com username.  When provided it is
+                passed directly to color-detection routines, bypassing the DOM
+                status-bar lookup.  Leave as None to auto-detect from the page.
+        """
+        self.chess_username = chess_username
         self.browser_launcher = None
         self.chesscom_interface = None
         self.driver = None
@@ -145,6 +152,8 @@ class VariantsClient:
         print("=" * 60)
         print("Tilted Variants Client")
         print("Chess.com Variants Terminal Interface")
+        if self.chess_username:
+            print(f"Username: {self.chess_username}")
         print("=" * 60)
         print()
 
@@ -1170,7 +1179,7 @@ class VariantsClient:
                     print("[Client] Checking game state...")
                     # First check player color with verbose output for debugging
                     print("[Client] Checking player color (verbose)...")
-                    color = self.chesscom_interface.get_player_color(verbose=True)
+                    color = self.chesscom_interface.get_player_color(username=self.chess_username, verbose=True)
 
                     # Now get full game state
                     game_state = self.chesscom_interface.get_game_state()
@@ -1698,7 +1707,23 @@ class VariantsClient:
 
 def main():
     """Main entry point."""
-    client = VariantsClient()
+    import argparse
+    parser = argparse.ArgumentParser(description="Tilted Variants Client")
+    parser.add_argument(
+        '--username', '-u',
+        metavar='USERNAME',
+        default=None,
+        help=(
+            "Your chess.com username.  When omitted the client auto-detects it "
+            "from the status bar after the browser opens."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.username:
+        print(f"[Client] Using username: {args.username}")
+
+    client = VariantsClient(chess_username=args.username)
     client.start()
 
 

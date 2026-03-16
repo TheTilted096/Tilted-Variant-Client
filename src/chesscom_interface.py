@@ -1130,129 +1130,126 @@ class ChessComInterface:
             #     looks choppy.  Click-click lets chess.com handle the
             #     animation itself via CSS transitions at native 60 fps.
             #
-            # Primary path — single execute_script (one HTTP round-trip):
-            #   Five separate execute_cdp_cmd calls cost ~25-35 ms each on
-            #   Windows/Edge, totalling ~150 ms before any sleep is counted.
-            #   A single execute_script replaces all of them with one call.
+            # Primary path — CDP Input.dispatchMouseEvent:
+            #   CDP events have isTrusted=true (browser-native), so chess.com
+            #   cannot filter them out.  JS-dispatched synthetic events have
+            #   isTrusted=false and chess.com ignores them on some configs.
+            #   We send mouseMoved before each click to update chess.com's
+            #   global cursor-position listeners, and a 150 ms gap between
+            #   the two clicks so React can commit the piece-selection state
+            #   before the destination click fires.
             #
-            # Fallback — CDP four-call sequence:
-            #   Used when execute_script returns False or raises; goes through
-            #   the browser's native input pipeline.
+            # Fallback — execute_async_script (JS synthetic events):
+            #   Kept for resilience; fires isTrusted=false events which may
+            #   not work on all chess.com versions but succeeds when CDP is
+            #   unavailable.
             x_from, y_from = from_coords['x'], from_coords['y']
             x_to,   y_to   = to_coords['x'],   to_coords['y']
 
-            # ── Primary: execute_async_script with 150 ms inter-click gap ────
-            # Five separate execute_cdp_cmd calls cost ~25-35 ms each on
-            # Windows/Edge (local HTTP overhead), totalling ~150 ms before any
-            # sleep is counted.  execute_async_script replaces all of them with
-            # a single HTTP round-trip that completes once the JS callback fires.
-            #
-            # Click-to-click animation requires two things beyond just firing
-            # two clicks:
-            #
-            #  1. Cursor-position context: chess.com tracks the global cursor
-            #     via document-level pointermove/mousemove listeners.  Without
-            #     a synthetic move event the board may not know where the cursor
-            #     "is", so the first click may not register as a piece selection.
-            #     We dispatch pointermove + mousemove to document before each
-            #     click to update that state.
-            #
-            #  2. Inter-click gap: the selection state (highlighted square, valid
-            #     move dots) must be committed and painted before the destination
-            #     click fires.  One requestAnimationFrame (~16 ms) is too short —
-            #     React's batching may collapse both clicks into one render pass,
-            #     skipping the CSS slide transition.  A 150 ms setTimeout gives
-            #     React time to commit, the browser to paint the selected state,
-            #     and the piece slide animation fires naturally on the second click.
-            js_ok = False
+            # ── Primary: CDP with mouseMoved + 150 ms inter-click gap ─────────
+            cdp_ok = False
             try:
-                js_ok = self.driver.execute_async_script("""
-                    var fx = arguments[0], fy = arguments[1];
-                    var tx = arguments[2], ty = arguments[3];
-                    var done = arguments[4];
+                # Inform chess.com's cursor-tracking listeners where the
+                # cursor "is" before each click.
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseMoved',
+                    'x': x_from, 'y': y_from,
+                    'button': 'none', 'buttons': 0,
+                })
+                time.sleep(0.004)
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mousePressed',
+                    'x': x_from, 'y': y_from,
+                    'button': 'left', 'clickCount': 1, 'buttons': 1,
+                })
+                time.sleep(0.004)
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseReleased',
+                    'x': x_from, 'y': y_from,
+                    'button': 'left', 'clickCount': 1, 'buttons': 0,
+                })
+                # Give React time to commit the piece-selection state and
+                # paint the valid-move dots before the destination click.
+                time.sleep(0.150)
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseMoved',
+                    'x': x_to, 'y': y_to,
+                    'button': 'none', 'buttons': 0,
+                })
+                time.sleep(0.004)
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mousePressed',
+                    'x': x_to, 'y': y_to,
+                    'button': 'left', 'clickCount': 1, 'buttons': 1,
+                })
+                time.sleep(0.004)
+                self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
+                    'type': 'mouseReleased',
+                    'x': x_to, 'y': y_to,
+                    'button': 'left', 'clickCount': 1, 'buttons': 0,
+                })
+                cdp_ok = True
+            except Exception as cdp_error:
+                print(f"[ChessCom] CDP error: {_short_err(cdp_error)}")
 
-                    function moveCursor(x, y) {
-                        var base = {
-                            bubbles: true, cancelable: true, view: window,
-                            clientX: x, clientY: y, screenX: x, screenY: y,
-                            buttons: 0
-                        };
-                        document.dispatchEvent(new PointerEvent('pointermove',
-                            Object.assign({}, base, {
-                                pointerId: 1, pointerType: 'mouse', isPrimary: true
-                            })));
-                        document.dispatchEvent(new MouseEvent('mousemove', base));
-                    }
-
-                    function syntheticClick(x, y) {
-                        var el = document.elementFromPoint(x, y);
-                        if (!el) return false;
-                        function mkP(t, b) {
-                            return new PointerEvent(t, {
-                                bubbles: true, cancelable: true, view: window,
-                                clientX: x,  clientY: y,
-                                screenX: x,  screenY: y,
-                                pointerId: 1, pointerType: 'mouse',
-                                isPrimary: true, button: 0, buttons: b
-                            });
-                        }
-                        function mkM(t, b) {
-                            return new MouseEvent(t, {
-                                bubbles: true, cancelable: true, view: window,
-                                clientX: x,  clientY: y,
-                                screenX: x,  screenY: y,
-                                button: 0, buttons: b
-                            });
-                        }
-                        el.dispatchEvent(mkP('pointerdown', 1));
-                        el.dispatchEvent(mkM('mousedown',   1));
-                        el.dispatchEvent(mkP('pointerup',   0));
-                        el.dispatchEvent(mkM('mouseup',     0));
-                        el.dispatchEvent(mkM('click',       0));
-                        return true;
-                    }
-
-                    moveCursor(fx, fy);
-                    if (!syntheticClick(fx, fy)) { done(false); return; }
-                    setTimeout(function() {
-                        moveCursor(tx, ty);
-                        done(syntheticClick(tx, ty));
-                    }, 150);
-                """, x_from, y_from, x_to, y_to) or False
-            except Exception:
-                pass
-
-            if not js_ok:
-                # ── Fallback: CDP multi-call (four HTTP round-trips) ──────────
-                # Used when execute_script returns False (element not found) or
-                # raises an exception.  Slower but goes through the browser's
-                # native input pipeline.
+            if not cdp_ok:
+                # ── Fallback: JS synthetic events (isTrusted=false) ───────────
                 try:
-                    self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                        'type': 'mousePressed',
-                        'x': x_from, 'y': y_from,
-                        'button': 'left', 'clickCount': 1
-                    })
-                    time.sleep(0.004)
-                    self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                        'type': 'mouseReleased',
-                        'x': x_from, 'y': y_from,
-                        'button': 'left', 'clickCount': 1
-                    })
-                    time.sleep(0.010)
-                    self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                        'type': 'mousePressed',
-                        'x': x_to, 'y': y_to,
-                        'button': 'left', 'clickCount': 1
-                    })
-                    time.sleep(0.004)
-                    self.driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                        'type': 'mouseReleased',
-                        'x': x_to, 'y': y_to,
-                        'button': 'left', 'clickCount': 1
-                    })
-                except Exception as cdp_error:
-                    print(f"[ChessCom] ✗ CDP error: {_short_err(cdp_error)}")
+                    self.driver.execute_async_script("""
+                        var fx = arguments[0], fy = arguments[1];
+                        var tx = arguments[2], ty = arguments[3];
+                        var done = arguments[4];
+
+                        function moveCursor(x, y) {
+                            var base = {
+                                bubbles: true, cancelable: true, view: window,
+                                clientX: x, clientY: y, screenX: x, screenY: y,
+                                buttons: 0
+                            };
+                            document.dispatchEvent(new PointerEvent('pointermove',
+                                Object.assign({}, base, {
+                                    pointerId: 1, pointerType: 'mouse', isPrimary: true
+                                })));
+                            document.dispatchEvent(new MouseEvent('mousemove', base));
+                        }
+
+                        function syntheticClick(x, y) {
+                            var el = document.elementFromPoint(x, y);
+                            if (!el) return false;
+                            function mkP(t, b) {
+                                return new PointerEvent(t, {
+                                    bubbles: true, cancelable: true, view: window,
+                                    clientX: x,  clientY: y,
+                                    screenX: x,  screenY: y,
+                                    pointerId: 1, pointerType: 'mouse',
+                                    isPrimary: true, button: 0, buttons: b
+                                });
+                            }
+                            function mkM(t, b) {
+                                return new MouseEvent(t, {
+                                    bubbles: true, cancelable: true, view: window,
+                                    clientX: x,  clientY: y,
+                                    screenX: x,  screenY: y,
+                                    button: 0, buttons: b
+                                });
+                            }
+                            el.dispatchEvent(mkP('pointerdown', 1));
+                            el.dispatchEvent(mkM('mousedown',   1));
+                            el.dispatchEvent(mkP('pointerup',   0));
+                            el.dispatchEvent(mkM('mouseup',     0));
+                            el.dispatchEvent(mkM('click',       0));
+                            return true;
+                        }
+
+                        moveCursor(fx, fy);
+                        if (!syntheticClick(fx, fy)) { done(false); return; }
+                        setTimeout(function() {
+                            moveCursor(tx, ty);
+                            done(syntheticClick(tx, ty));
+                        }, 150);
+                    """, x_from, y_from, x_to, y_to)
+                except Exception as js_error:
+                    print(f"[ChessCom] ✗ JS fallback error: {_short_err(js_error)}")
                     return False
 
             # Brief settle for chess.com to process the move.
@@ -1681,8 +1678,8 @@ class ChessComInterface:
 
         This is the main entry point that tries multiple methods:
         1. Drop moves: make_drop_move (for piece placements)
-        2. CDP Input.dispatchMouseEvent (exact Puppeteer equivalent)
-        3. JavaScript DOM event dispatch (backup)
+        2. CDP Input.dispatchMouseEvent (trusted events, primary)
+        3. JavaScript DOM event dispatch (untrusted fallback)
         4. ActionChains (requires focus - last resort)
 
         Args:

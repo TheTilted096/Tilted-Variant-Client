@@ -67,8 +67,36 @@ class BrowserLauncher:
 
         return None
 
+    def kill_existing_edge_processes(self):
+        """Kill any running Edge processes so a fresh debuggable instance can start.
+
+        Edge keeps a background process alive even after all windows are closed
+        (for sync/notifications).  That process holds a lock on the default user
+        data directory, which prevents a new Edge instance from opening a
+        separate debugging session on the same profile.  Killing it first is the
+        most reliable fix.
+        """
+        print("[Browser] Terminating any existing Edge processes...")
+        try:
+            if sys.platform == "win32":
+                result = subprocess.run(
+                    ['taskkill', '/F', '/IM', 'msedge.exe'],
+                    capture_output=True, text=True,
+                )
+                if result.returncode == 0:
+                    print("[Browser] Existing Edge processes terminated")
+                    time.sleep(1)  # Let the OS release file/port locks
+                else:
+                    print("[Browser] No existing Edge processes found")
+            else:
+                subprocess.run(['pkill', '-f', 'microsoft-edge'], capture_output=True)
+        except Exception as e:
+            print(f"[Browser] Warning: could not kill Edge processes: {_short_err(e)}")
+
     def launch_edge_process(self):
         """Launch Edge as a subprocess with debugging enabled."""
+        self.kill_existing_edge_processes()
+
         edge_path = self.find_edge_executable()
 
         if not edge_path:
